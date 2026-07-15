@@ -1,4 +1,4 @@
-const CACHE_NAME = 'rendo-v1.0.0-shell';
+const CACHE_NAME = 'rendo-v1.0.4-shell';
 const APP_SHELL = [
   './','./index.html','./style.css','./app.js','./calc.js','./firebase.js','./crypto-utils.js','./config.js',
   './manifest.webmanifest','./version.json','./icons/favicon-16.png','./icons/favicon-32.png',

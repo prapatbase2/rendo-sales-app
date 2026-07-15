@@ -464,29 +464,43 @@ async function handleFirstOwner(event) {
     await checkInitialization();
     if (state.initialized) throw new Error('มีเจ้าของคนแรกแล้ว กรุณากลับไปหน้าเข้าสู่ระบบ');
     secondary = await createSecondaryAuthUser(loginId, pin);
+
+    // Sign the primary Firebase app in before writing Firestore. All transaction
+    // references below are then created from the same primary Firestore instance.
+    // This avoids mixing DocumentReference objects from primary/secondary apps.
+    const primaryCredential = await signInWithLoginId(loginId, pin);
+    const uid = primaryCredential.user.uid;
+    if (uid !== secondary.uid) throw new Error('Firebase UID ไม่ตรงกัน กรุณาลองใหม่');
+
     const keys = await generatePinVaultKeys();
     const pinCiphertext = await encryptPin(keys.publicJwk, pin);
-    const uid = secondary.uid;
     const today = dateToday();
-    await F.runTransaction(secondary.db, async (tx) => {
-      const initRef = F.doc(secondary.db, 'system', 'initialization');
+    await F.runTransaction(db, async (tx) => {
+      const initRef = F.doc(db, 'system', 'initialization');
+      const userRef = F.doc(db, 'users', uid);
+      const pinRef = F.doc(db, 'userPins', uid);
+      const publicKeyRef = F.doc(db, 'securityKeys', 'pinPublic');
+      const privateKeyRef = F.doc(db, 'ownerSecrets', 'pinPrivate');
+      const settingsRef = F.doc(db, 'appSettings', 'main');
+      const auditRef = F.doc(F.collection(db, 'auditLogs'));
+
       const initSnap = await tx.get(initRef);
       if (initSnap.exists()) throw new Error('มีเจ้าของคนแรกแล้วจากอุปกรณ์อื่น');
       tx.set(initRef, { initialized: true, ownerUid: uid, schemaVersion: SCHEMA_VERSION, appVersion: APP_VERSION, createdAt: F.serverTimestamp() });
-      tx.set(F.doc(secondary.db, 'users', uid), {
+      tx.set(userRef, {
         displayName, loginId, role: ROLE.OWNER, active: true, startDate: today, endDate: '', canUseAdvance: true,
         createdAt: F.serverTimestamp(), createdBy: uid, updatedAt: F.serverTimestamp(), updatedBy: uid
       });
-      tx.set(F.doc(secondary.db, 'userPins', uid), {
+      tx.set(pinRef, {
         ciphertext: pinCiphertext, algorithm: 'RSA-OAEP-SHA256', updatedAt: F.serverTimestamp(), updatedBy: uid
       });
-      tx.set(F.doc(secondary.db, 'securityKeys', 'pinPublic'), { publicJwk: keys.publicJwk, createdAt: F.serverTimestamp() });
-      tx.set(F.doc(secondary.db, 'ownerSecrets', 'pinPrivate'), { privateJwk: keys.privateJwk, createdAt: F.serverTimestamp() });
-      tx.set(F.doc(secondary.db, 'appSettings', 'main'), {
+      tx.set(publicKeyRef, { publicJwk: keys.publicJwk, createdAt: F.serverTimestamp() });
+      tx.set(privateKeyRef, { privateJwk: keys.privateJwk, createdAt: F.serverTimestamp() });
+      tx.set(settingsRef, {
         ...DEFAULT_SETTINGS, appVersion: APP_VERSION, schemaVersion: SCHEMA_VERSION,
         updatedAt: F.serverTimestamp(), updatedBy: uid
       });
-      tx.set(F.doc(F.collection(secondary.db, 'auditLogs')), {
+      tx.set(auditRef, {
         action: 'initialize', area: 'system', targetId: 'initialization', actorId: uid, actorName: displayName,
         actorRole: ROLE.OWNER, before: null, after: { initialized: true, ownerUid: uid }, reason: 'สร้างเจ้าของคนแรก',
         hidden: false, createdAt: F.serverTimestamp(), monthKey: currentMonthKey()
@@ -495,7 +509,6 @@ async function handleFirstOwner(event) {
     await secondary.cleanup();
     secondary = null;
     state.initialized = true;
-    await signInWithLoginId(loginId, pin);
   } catch (error) {
     if (secondary) await secondary.cleanup({ removeAuthUser: true });
     $('#owner-message').textContent = friendlyError(error);
