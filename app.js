@@ -468,7 +468,7 @@ async function handleFirstOwner(event) {
     const pinCiphertext = await encryptPin(keys.publicJwk, pin);
     const uid = secondary.uid;
     const today = dateToday();
-    await F.runTransaction(db, async (tx) => {
+    await F.runTransaction(secondary.db, async (tx) => {
       const initRef = F.doc(db, 'system', 'initialization');
       const initSnap = await tx.get(initRef);
       if (initSnap.exists()) throw new Error('มีเจ้าของคนแรกแล้วจากอุปกรณ์อื่น');

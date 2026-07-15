@@ -80,6 +80,7 @@ export async function createSecondaryAuthUser(loginId, pin) {
   const name = `secondary-${Date.now()}-${Math.random().toString(36).slice(2)}`;
   const secondary = initializeApp(firebaseConfig, name);
   const secondaryAuth = getAuth(secondary);
+  const secondaryDb = getFirestore(secondary);
   await setPersistence(secondaryAuth, browserSessionPersistence);
   const credential = await createUserWithEmailAndPassword(
     secondaryAuth, loginEmail(loginId), await derivePassword(loginId, pin)
@@ -87,6 +88,7 @@ export async function createSecondaryAuthUser(loginId, pin) {
   return {
     uid: credential.user.uid,
     user: credential.user,
+    db: secondaryDb,
     async cleanup({ removeAuthUser = false } = {}) {
       try { if (removeAuthUser && secondaryAuth.currentUser) await deleteUser(secondaryAuth.currentUser); } catch {}
       try { await signOut(secondaryAuth); } catch {}
