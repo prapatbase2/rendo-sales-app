@@ -469,24 +469,24 @@ async function handleFirstOwner(event) {
     const uid = secondary.uid;
     const today = dateToday();
     await F.runTransaction(secondary.db, async (tx) => {
-      const initRef = F.doc(db, 'system', 'initialization');
+      const initRef = F.doc(secondary.db, 'system', 'initialization');
       const initSnap = await tx.get(initRef);
       if (initSnap.exists()) throw new Error('มีเจ้าของคนแรกแล้วจากอุปกรณ์อื่น');
       tx.set(initRef, { initialized: true, ownerUid: uid, schemaVersion: SCHEMA_VERSION, appVersion: APP_VERSION, createdAt: F.serverTimestamp() });
-      tx.set(F.doc(db, 'users', uid), {
+      tx.set(F.doc(secondary.db, 'users', uid), {
         displayName, loginId, role: ROLE.OWNER, active: true, startDate: today, endDate: '', canUseAdvance: true,
         createdAt: F.serverTimestamp(), createdBy: uid, updatedAt: F.serverTimestamp(), updatedBy: uid
       });
-      tx.set(F.doc(db, 'userPins', uid), {
+      tx.set(F.doc(secondary.db, 'userPins', uid), {
         ciphertext: pinCiphertext, algorithm: 'RSA-OAEP-SHA256', updatedAt: F.serverTimestamp(), updatedBy: uid
       });
-      tx.set(F.doc(db, 'securityKeys', 'pinPublic'), { publicJwk: keys.publicJwk, createdAt: F.serverTimestamp() });
-      tx.set(F.doc(db, 'ownerSecrets', 'pinPrivate'), { privateJwk: keys.privateJwk, createdAt: F.serverTimestamp() });
-      tx.set(F.doc(db, 'appSettings', 'main'), {
+      tx.set(F.doc(secondary.db, 'securityKeys', 'pinPublic'), { publicJwk: keys.publicJwk, createdAt: F.serverTimestamp() });
+      tx.set(F.doc(secondary.db, 'ownerSecrets', 'pinPrivate'), { privateJwk: keys.privateJwk, createdAt: F.serverTimestamp() });
+      tx.set(F.doc(secondary.db, 'appSettings', 'main'), {
         ...DEFAULT_SETTINGS, appVersion: APP_VERSION, schemaVersion: SCHEMA_VERSION,
         updatedAt: F.serverTimestamp(), updatedBy: uid
       });
-      tx.set(F.doc(F.collection(db, 'auditLogs')), {
+      tx.set(F.doc(F.collection(secondary.db, 'auditLogs')), {
         action: 'initialize', area: 'system', targetId: 'initialization', actorId: uid, actorName: displayName,
         actorRole: ROLE.OWNER, before: null, after: { initialized: true, ownerUid: uid }, reason: 'สร้างเจ้าของคนแรก',
         hidden: false, createdAt: F.serverTimestamp(), monthKey: currentMonthKey()
