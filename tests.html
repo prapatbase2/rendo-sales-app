@@ -1,0 +1,10 @@
+<!doctype html><html lang="th"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Rendo Calculation Tests</title><link rel="stylesheet" href="style.css"><body><main style="padding:20px"><h1>Rendo v1.0 — Calculation Tests</h1><div id="result" class="card">กำลังทดสอบ…</div></main><script type="module">
+import {ROLE,DEFAULT_SETTINGS,calculateSales,calculateCashEquation,calculateBeerAllocation,calculateCompensationMonth,calculateDashboard} from './calc.js';
+const tests=[];const test=(n,f)=>tests.push([n,f]);const eq=(a,b)=>{if(a!==b)throw new Error(`${a} !== ${b}`)};
+test('ยอดขายรวม/รายได้',()=>{const r=calculateSales({foodCents:100000,beverageCents:50000,discountCents:10000,cashCents:140000});eq(r.revenueCents,140000);eq(r.paymentDifferenceCents,0)});
+test('เงินสดตรง',()=>eq(calculateCashEquation({openingCashCents:10000,cashSalesCents:50000,shiftExpenses:[{amountCents:5000}],cashToOwnerCents:20000,closingCashCents:35000}).status,'balanced'));
+test('Draft ไม่เข้าคำนวณ',()=>eq(calculateDashboard({sales:[{status:'draft',storeStatus:'open',revenueCents:9999},{status:'final',storeStatus:'open',revenueCents:100}],grossMarginRate:1}).revenueCents,100));
+test('โบนัสเบียร์เก็บเศษสตางค์',()=>{const a=['a','b','c'].map(userId=>({userId,date:'2026-07-01',role:ROLE.FRONT_STAFF,status:'full_day'}));const r=calculateBeerAllocation({sales:[{date:'2026-07-01',status:'final',storeStatus:'open',beerBottles:1}],attendance:a,settings:{...DEFAULT_SETTINGS,beerRateCents:500}});eq(Object.values(r.byUser).reduce((x,y)=>x+y,0),500)});
+test('เงินเบิกไม่ลดต้นทุนซ้ำ',()=>{const r=calculateCompensationMonth({users:[{id:'f',displayName:'F',role:ROLE.FRONT_STAFF}],profiles:{f:{baseSalaryCents:1000000,socialSecurityEnabled:false}},advances:[{userId:'f',amountCents:20000}],settings:DEFAULT_SETTINGS}).records[0];eq(r.transferCents,980000);eq(r.shopCostCents,1000000)});
+let html='';let pass=0;for(const [name,fn] of tests){try{fn();pass++;html+=`<p>✅ ${name}</p>`}catch(e){html+=`<p>❌ ${name}: ${e.message}</p>`}}document.querySelector('#result').innerHTML=`<h2>${pass}/${tests.length} ผ่าน</h2>${html}`;
+</script></body></html>
