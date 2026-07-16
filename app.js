@@ -5,7 +5,7 @@ import {
   addDoc, setDoc, updateDoc, deleteDoc, query, where, writeBatch, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
-const VERSION = "v1.1.0";
+const VERSION = "v1.2.0";
 const STORAGE_KEY = "rendo_remember_v1";
 const SESSION_KEY = "rendo_session_unlock_v1";
 const COLLECTIONS = [
@@ -52,7 +52,10 @@ let state = {
   app:null, auth:null, db:null, authUid:null,
   users:[], publicUsers:[], pinVault:{}, settings:clone(DEFAULT_SETTINGS), currentUser:null, currentPage:"dashboard",
   online:navigator.onLine, charts:{}, backupTimer:null, backupDebounce:null, backupInProgress:false, backupQueued:false,
-  saleLoaded:null, restorePreview:null, navRequestId:0, attendanceLoadSeq:0, monthlyLoadSeq:0, compensationLoadSeq:0,
+  saleLoaded:null, restorePreview:null, navRequestId:0,
+  attendanceFormLoadSeq:0, attendanceResultLoadSeq:0, salesLoadSeq:0,
+  dashboardLoadSeq:0, monthlyLoadSeq:0, advancesLoadSeq:0,
+  compensationLoadSeq:0, ownerExpensesLoadSeq:0, historyLoadSeq:0,
   compSelectedIndex:0, compDrafts:{}, dataCache:new Map()
 };
 
@@ -78,19 +81,55 @@ function friendlyError(err){
   if(code==="failed-precondition"&&String(err?.message||"").includes("index")) return "Firestore ยังไม่มีดัชนีที่จำเป็น กรุณาสร้าง Index ตามลิงก์ที่ Firebase แสดง";
   return err?.message||"เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ";
 }
-async function getDocsResilient(ref,label="โหลดข้อมูล",timeoutMs=15000){
+async function getDocsResilient(ref,label="โหลดข้อมูล",timeoutMs=8000){
+  // ใช้ cache ก่อนเมื่อมีข้อมูล เพื่อลดอาการค้างบนเน็ตช้า แล้วอัปเดต cache จากเครือข่ายเบื้องหลัง
+  let cached=null;
+  try{ cached=await getDocsFromCache(ref); }catch(_){ cached=null; }
+  if(cached && !cached.empty){
+    withTimeout(getDocs(ref),timeoutMs,label).catch(err=>{
+      if(["permission-denied","failed-precondition"].includes(err?.code)) console.warn(label,err);
+    });
+    return cached;
+  }
   try{return await withTimeout(getDocs(ref),timeoutMs,label);}
   catch(err){
     if(["permission-denied","failed-precondition"].includes(err?.code)) throw err;
+    if(cached) return cached;
     try{return await getDocsFromCache(ref);}catch(_){throw err;}
   }
 }
-async function getDocResilient(ref,label="โหลดข้อมูล",timeoutMs=12000){
+async function getDocResilient(ref,label="โหลดข้อมูล",timeoutMs=7000){
+  let cached=null;
+  try{ cached=await getDocFromCache(ref); }catch(_){ cached=null; }
+  if(cached?.exists()){
+    withTimeout(getDoc(ref),timeoutMs,label).catch(()=>null);
+    return cached;
+  }
   try{return await withTimeout(getDoc(ref),timeoutMs,label);}
   catch(err){
     if(["permission-denied","failed-precondition"].includes(err?.code)) throw err;
+    if(cached) return cached;
     try{return await getDocFromCache(ref);}catch(_){throw err;}
   }
+}
+function pageStillActive(page,requestId){ return state.currentPage===page && state.navRequestId===requestId; }
+function invalidateDataCache(collectionName){
+  for(const key of state.dataCache.keys()) if(key.startsWith(`${collectionName}|`)) state.dataCache.delete(key);
+}
+function bindFriendlyNumberInputs(root=document){
+  root.querySelectorAll('input[type="number"]:not([readonly]):not([data-friendly-number-bound])').forEach(input=>{
+    input.dataset.friendlyNumberBound="1";
+    input.addEventListener("focus",()=>{
+      if(String(input.value).trim()!=="" && numberValue(input.value)===0){ input.value=""; }
+      else requestAnimationFrame(()=>input.select?.());
+    });
+    input.addEventListener("blur",()=>{
+      if(String(input.value).trim()===""){
+        input.value="0";
+        input.dispatchEvent(new Event("input",{bubbles:true}));
+      }
+    });
+  });
 }
 function setButtonBusy(button,busy,text="กำลังบันทึก..."){
   if(!button)return;
@@ -179,7 +218,7 @@ async function registerServiceWorker(){
     try{
       const reg=await navigator.serviceWorker.register("./sw.js",{updateViaCache:"none"}); await reg.update().catch(()=>null);
       const activate=()=>reg.waiting?.postMessage("SKIP_WAITING"); if(reg.waiting)activate(); reg.addEventListener("updatefound",()=>reg.installing?.addEventListener("statechange",()=>{if(reg.waiting)activate();}));
-      navigator.serviceWorker.addEventListener("controllerchange",()=>{if(sessionStorage.getItem("rendo_sw_reloaded_110"))return;sessionStorage.setItem("rendo_sw_reloaded_110","1");location.reload();});
+      navigator.serviceWorker.addEventListener("controllerchange",()=>{if(sessionStorage.getItem("rendo_sw_reloaded_120"))return;sessionStorage.setItem("rendo_sw_reloaded_120","1");location.reload();});
     }catch(e){ console.warn("SW",e); }
   }
 }
@@ -277,11 +316,11 @@ $("#changePinTopBtn").onclick=async()=>{
 };
 
 async function audit(action,details={},before=null,after=null,actorOverride=null,category="activity"){
-  try{ const a=actorOverride||state.currentUser||{}; await addDoc(collection(state.db,"auditLogs"),{
+  try{ const a=actorOverride||state.currentUser||{}; await withTimeout(addDoc(collection(state.db,"auditLogs"),{
     action,details:safeClone(details),before:safeClone(before),after:safeClone(after),category,
     actorId:a.id||null,actorName:a.name||"ไม่ทราบชื่อ",role:a.role||null,hidden:false,
     createdAt:serverTimestamp(),createdAtISO:new Date().toISOString(),authUid:state.authUid
-  }); }catch(e){ console.warn("audit",e); }
+  }),5000,"บันทึกประวัติ"); }catch(e){ console.warn("audit",e); }
 }
 async function afterWrite(name){
   const mode=state.settings.autoBackup?.mode||"off"; if(mode!=="onAction"&&mode!=="both") return;
@@ -313,6 +352,10 @@ function buildNav(){ const items=visibleNavItems(); $("#bottomNav").innerHTML=it
 async function navigate(page){
   const allowed=visibleNavItems().some(n=>n.id===page); if(!allowed) page=visibleNavItems()[0]?.id||"monthly";
   state.currentPage=page; const requestId=++state.navRequestId;
+  // ยกเลิกผลลัพธ์จากหน้าก่อนหน้า ไม่ให้คำตอบช้ามาเขียนทับหน้าปัจจุบัน
+  state.attendanceFormLoadSeq++; state.attendanceResultLoadSeq++; state.salesLoadSeq++;
+  state.dashboardLoadSeq++; state.monthlyLoadSeq++; state.advancesLoadSeq++;
+  state.compensationLoadSeq++; state.ownerExpensesLoadSeq++; state.historyLoadSeq++;
   $$(".nav-item").forEach(b=>{b.classList.toggle("active",b.dataset.page===page);b.disabled=b.dataset.page===page;});
   const map={dashboard:renderDashboard,sales:renderSales,attendance:renderAttendance,monthly:renderMonthly,advances:renderAdvances,compensation:renderCompensation,ownerExpenses:renderOwnerExpenses,history:()=>renderHistory("activity"),systemHistory:()=>renderHistory("system"),backup:renderBackup,users:renderUsers,settings:renderSettings};
   setLoading();
@@ -322,15 +365,44 @@ async function navigate(page){
     if(requestId===state.navRequestId&&state.currentPage===page) content().innerHTML=`<div class="state error"><b>โหลดหน้านี้ไม่สำเร็จ</b><br>${escapeHtml(friendlyError(e))}<div style="margin-top:12px"><button class="btn secondary retry-page" type="button">ลองใหม่</button></div></div>`;
     $(".retry-page")&&($(".retry-page").onclick=()=>navigate(page));
   }finally{
-    if(requestId===state.navRequestId){$$(".nav-item").forEach(b=>b.disabled=false);updateOnlineUi();}
+    if(requestId===state.navRequestId){
+      $$(".nav-item").forEach(b=>b.disabled=false);
+      bindFriendlyNumberInputs(content());
+      updateOnlineUi();
+    }
   }
 }
 function pageTitle(title,sub=""){ return `<div class="page-title"><div><h2>${escapeHtml(title)}</h2>${sub?`<p>${escapeHtml(sub)}</p>`:""}</div><span class="pill muted">${escapeHtml(ROLE_LABELS[state.currentUser.role])}: ${escapeHtml(state.currentUser.name)}</span></div>`; }
 function metricCards(items){ return `<div class="metrics">${items.map(x=>`<div class="metric"><small>${escapeHtml(x.label)}</small><b>${escapeHtml(x.value)}</b>${x.sub?`<span>${escapeHtml(x.sub)}</span>`:""}</div>`).join("")}</div>`; }
 function drawBar(id,labels,values,label){ const el=document.getElementById(id); if(!el) return; if(window.Chart){ state.charts[id]?.destroy(); state.charts[id]=new Chart(el,{type:"bar",data:{labels,datasets:[{label,data:values}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true}}}}); } }
-async function docsByMonth(name,monthKey){ const snap=await getDocsResilient(query(collection(state.db,name),where("monthKey","==",monthKey)),`โหลด ${name} เดือน ${monthKey}`); return snap.docs.map(d=>({id:d.id,...d.data()})); }
-async function docsByMonthForUser(name,monthKey,userId){ const snap=await getDocsResilient(query(collection(state.db,name),where("monthKey","==",monthKey),where("userId","==",userId)),`โหลด ${name} ของพนักงาน`); return snap.docs.map(d=>({id:d.id,...d.data()})); }
-async function allDocs(name){ const snap=await getDocsResilient(collection(state.db,name),`โหลด ${name}`); return snap.docs.map(d=>({id:d.id,...d.data()})); }
+async function cachedQuery(key,loader,maxAgeMs=30000){
+  const hit=state.dataCache.get(key),now=Date.now();
+  if(hit?.data && now-hit.time<maxAgeMs) return hit.data.map(x=>({...x}));
+  if(hit?.promise) return hit.promise;
+  const promise=Promise.resolve().then(loader).then(data=>{
+    state.dataCache.set(key,{data,time:Date.now()});
+    return data.map(x=>({...x}));
+  }).catch(err=>{ state.dataCache.delete(key); throw err; });
+  state.dataCache.set(key,{promise,time:now});
+  return promise;
+}
+async function docsByMonth(name,monthKey,{force=false}={}){
+  const key=`${name}|month|${monthKey}`; if(force) state.dataCache.delete(key);
+  return cachedQuery(key,async()=>{ const snap=await getDocsResilient(query(collection(state.db,name),where("monthKey","==",monthKey)),`โหลด ${name} เดือน ${monthKey}`); return snap.docs.map(d=>({id:d.id,...d.data()})); });
+}
+async function docsByMonthForUser(name,monthKey,userId,{force=false}={}){
+  // ใช้ query เดือนเดียวแล้วกรองพนักงานในเครื่อง เพื่อลดจุดล้มเหลวและไม่บังคับสร้าง Composite Index เพิ่ม
+  // ร้านมีประมาณ 10 คน ข้อมูลสูงสุดราว 310 รายการ/เดือน จึงยังโหลดเร็วและเสถียรกว่าการรอ index ที่อาจยังไม่ได้ Deploy
+  const key=`${name}|month-user|${monthKey}|${userId}`; if(force) state.dataCache.delete(key);
+  return cachedQuery(key,async()=>{
+    const rows=await docsByMonth(name,monthKey,{force});
+    return rows.filter(row=>row.userId===userId);
+  });
+}
+async function allDocs(name,{force=false}={}){
+  const key=`${name}|all`; if(force) state.dataCache.delete(key);
+  return cachedQuery(key,async()=>{ const snap=await getDocsResilient(collection(state.db,name),`โหลด ${name}`); return snap.docs.map(d=>({id:d.id,...d.data()})); });
+}
 function saleExpenseCash(s){ return (s.expenses||[]).filter(e=>!e.ownerTransfer).reduce((a,e)=>a+numberValue(e.amount),0); }
 function saleExpenseTotal(s){ return (s.expenses||[]).reduce((a,e)=>a+numberValue(e.amount),0); }
 
@@ -338,9 +410,11 @@ async function renderDashboard(){
   if(!isOwnerOrManager()) return content().innerHTML=`<div class="state error">ไม่มีสิทธิ์</div>`;
   const start=`${currentMonthKey()}-01`,end=todayISO();
   content().innerHTML=`${pageTitle("แดชบอร์ด","ภาพรวมรายได้และค่าใช้จ่ายของร้าน")}
-  <div class="panel"><div class="grid three"><div class="field"><label>ตั้งแต่วันที่</label><input id="dashStart" type="date" value="${start}"></div><div class="field"><label>ถึงวันที่</label><input id="dashEnd" type="date" value="${end}"></div><div class="field"><label>&nbsp;</label><button id="dashLoad" class="btn">แสดงผล</button></div></div></div><div id="dashResult"></div>`;
-  $("#dashLoad").onclick=loadDashboard; await loadDashboard();
+  <div class="panel"><div class="grid three"><div class="field"><label>ตั้งแต่วันที่</label><input id="dashStart" type="date" value="${start}"></div><div class="field"><label>ถึงวันที่</label><input id="dashEnd" type="date" value="${end}"></div><div class="field"><label>&nbsp;</label><button id="dashLoad" type="button" class="btn">แสดงผล</button></div></div></div><div id="dashResult"><div class="loading">กำลังคำนวณ...</div></div>`;
+  $("#dashLoad").onclick=()=>loadDashboard().catch(err=>showToast(friendlyError(err)));
+  loadDashboard().catch(err=>{if(state.currentPage==="dashboard"&&$("#dashResult"))$("#dashResult").innerHTML=`<div class="state error">${escapeHtml(friendlyError(err))}</div>`;});
 }
+
 async function recurringTotalForMonth(monthKey){
   const monthly=await docsByMonth("recurringExpenseMonths",monthKey);
   if(monthly.length) return monthly.reduce((s,x)=>s+numberValue(x.amount),0);
@@ -352,19 +426,19 @@ async function compensationCostForMonth(monthKey){
   return data.rows.reduce((s,x)=>s+numberValue(x.totalCost),0);
 }
 async function loadDashboard(){
-  const start=$("#dashStart").value,end=$("#dashEnd").value; if(!start||!end||start>end) return showToast("ช่วงวันที่ไม่ถูกต้อง");
-  $("#dashResult").innerHTML=`<div class="loading">กำลังคำนวณ...</div>`;
+  const start=$("#dashStart")?.value,end=$("#dashEnd")?.value,result=$("#dashResult"); if(!result)return;
+  if(!start||!end||start>end) return showToast("ช่วงวันที่ไม่ถูกต้อง");
+  const seq=++state.dashboardLoadSeq,requestId=state.navRequestId; result.innerHTML=`<div class="loading">กำลังคำนวณ...</div>`;
   const months=[]; for(let m=monthOf(start);m<=monthOf(end);m=nextMonthKey(m)) months.push(m);
   const [allSales,otherExp]=await Promise.all([Promise.all(months.map(m=>docsByMonth("dailySales",m))),Promise.all(months.map(m=>docsByMonth("ownerExpenses",m)))]);
+  if(seq!==state.dashboardLoadSeq||!pageStillActive("dashboard",requestId)||!$("#dashResult"))return;
   const sales=allSales.flat().filter(s=>s.date>=start&&s.date<=end&&!s.closed);
-  const ownerOther=otherExp.flat().filter(x=>x.date>=start&&x.date<=end).reduce((s,x)=>s+numberValue(x.amount),0);
-  let recurring=0,compCost=0; for(const m of months){ recurring+=await recurringTotalForMonth(m); compCost+=await compensationCostForMonth(m); }
-  const income=sales.reduce((s,x)=>s+numberValue(x.netIncome),0);
-  const saleExpenses=sales.reduce((s,x)=>s+saleExpenseTotal(x),0);
-  const ownerCash=sales.reduce((s,x)=>s+numberValue(x.ownerCashOut),0);
-  const ownerEntered=ownerOther+recurring+compCost;
-  const margin=numberValue(state.settings.dashboardMarginRate||.4);
-  const net=income*margin-saleExpenses-ownerEntered;
+  const ownerOther=otherExp.flat().filter(x=>x.date>=start&&x.date<=end).reduce((sum,x)=>sum+numberValue(x.amount),0);
+  const monthlyCosts=await Promise.all(months.map(async m=>({recurring:await recurringTotalForMonth(m),comp:await compensationCostForMonth(m)})));
+  if(seq!==state.dashboardLoadSeq||!pageStillActive("dashboard",requestId)||!$("#dashResult"))return;
+  const recurring=monthlyCosts.reduce((sum,x)=>sum+x.recurring,0),compCost=monthlyCosts.reduce((sum,x)=>sum+x.comp,0);
+  const income=sales.reduce((sum,x)=>sum+numberValue(x.netIncome),0),saleExpenses=sales.reduce((sum,x)=>sum+saleExpenseTotal(x),0),ownerCash=sales.reduce((sum,x)=>sum+numberValue(x.ownerCashOut),0);
+  const ownerEntered=ownerOther+recurring+compCost,margin=numberValue(state.settings.dashboardMarginRate||.4),net=income*margin-saleExpenses-ownerEntered;
   const dayMap={}; sales.forEach(s=>dayMap[s.date]=(dayMap[s.date]||0)+numberValue(s.netIncome)); const dates=Object.keys(dayMap).sort();
   $("#dashResult").innerHTML=`${metricCards([
     {label:"รายได้รวม",value:`${money(income)} บาท`,sub:`${thaiDate(start)} – ${thaiDate(end)}`},
@@ -376,6 +450,7 @@ async function loadDashboard(){
   <div class="panel"><h3>รายการยอดขายล่าสุด</h3>${salesTable(sales.sort((a,b)=>String(b.date).localeCompare(String(a.date))).slice(0,10))}</div>`;
   drawBar("dashChart",dates.map(d=>d.slice(8)),dates.map(d=>dayMap[d]),"รายได้");
 }
+
 function nextMonthKey(m){ const [y,mo]=m.split("-").map(Number); const d=new Date(y,mo,1); return `${d.getFullYear()}-${String(d.getMonth()+1).padStart(2,"0")}`; }
 
 /* ----------------------------- ยอดขายรายวัน ----------------------------- */
@@ -411,9 +486,9 @@ async function yesterdaySaleWarning(){
 }
 async function renderSales(){
   if(!["owner","manager","supervisor","front_staff"].includes(state.currentUser.role)) return content().innerHTML=`<div class="state error">ไม่มีสิทธิ์ลงยอดขาย</div>`;
-  const warning=await yesterdaySaleWarning();
-  content().innerHTML=`${pageTitle("ยอดขาย","บันทึกยอดอาหาร เครื่องดื่ม เงินสด และรายจ่ายประจำวัน")}${warning}
-  <div class="panel daily-panel"><div class="grid three"><div class="field"><label>วันที่</label><input id="saleDate" type="date" value="${todayISO()}"><small id="saleThaiDate">${thaiDate(todayISO())}</small></div><div class="field"><label>&nbsp;</label><button id="loadSale" class="btn secondary">โหลดวันที่นี้</button></div><div class="field"><label>&nbsp;</label><span id="saleState" class="pill muted">รายการใหม่</span></div></div></div>
+  const requestId=state.navRequestId;
+  content().innerHTML=`${pageTitle("ยอดขาย","บันทึกยอดอาหาร เครื่องดื่ม เงินสด และรายจ่ายประจำวัน")}<div id="saleWarning"></div>
+  <div class="panel daily-panel"><div class="grid three"><div class="field"><label>วันที่</label><input id="saleDate" type="date" value="${todayISO()}"><small id="saleThaiDate">${thaiDate(todayISO())}</small></div><div class="field"><label>&nbsp;</label><button id="loadSale" type="button" class="btn secondary">โหลดวันที่นี้</button></div><div class="field"><label>&nbsp;</label><span id="saleState" class="pill muted">กำลังตรวจข้อมูล...</span></div></div></div>
   <form id="saleForm">
     <section class="panel daily-section"><label class="check-item"><input id="saleClosed" type="checkbox"> วันนี้หยุดร้าน</label><div id="closedNoteBox" class="field hidden" style="margin-top:10px"><label>หมายเหตุวันหยุด</label><input id="closedNote" placeholder="เช่น หยุดประจำสัปดาห์"></div></section>
     <div id="openSaleFields">
@@ -429,7 +504,7 @@ async function renderSales(){
         <div class="field"><label>เงินสด + โอน ต่างจากรายได้</label><input id="paymentDiff" readonly value="0"></div>
       </div></section>
       <section class="panel daily-section cash-section"><h3>💵 เงินสดในกะ</h3><div class="grid three">
-        <div class="field"><label>เงินสดเปิดกะ</label><input id="cashOpen" inputmode="decimal" type="number" step="0.01" value="0"></div>
+        <div class="field important-field"><label>เงินสดเปิดกะ</label><input id="cashOpen" inputmode="decimal" type="number" step="0.01" value="0"><small>ระบบดึงจากยอดปิดกะล่าสุดก่อนหน้านี้ และแก้ไขได้</small></div>
         <div class="field"><label>เอาเงินสดให้เจ้าของ</label><input id="ownerCashOut" inputmode="decimal" type="number" min="0" step="0.01" value="0"></div>
         <div class="field"><label>เงินสดปิดกะ</label><input id="cashClose" inputmode="decimal" type="number" step="0.01" value="0"></div>
         <div class="field"><label>รายจ่ายหักเงินสด</label><input id="cashExpenses" readonly value="0"></div>
@@ -439,17 +514,26 @@ async function renderSales(){
       <section class="panel daily-section"><div class="flex"><h3>🧾 รายจ่ายในวันนั้น</h3><button id="addExpense" type="button" class="btn secondary small">+ เพิ่มรายจ่าย</button></div><div id="expenseRows" class="expense-list"></div></section>
       <section class="panel"><div class="field"><label>หมายเหตุเพิ่มเติม</label><textarea id="saleNote" rows="2"></textarea></div></section>
     </div>
-    <div class="sticky-save grid two"><button id="saveDraft" type="button" class="btn secondary write-action">บันทึกชั่วคราว</button><button type="submit" class="btn write-action">บันทึกยอดขายจริง</button></div>
+    <div class="sticky-save grid two"><button id="saveDraft" type="button" class="btn secondary write-action">บันทึกชั่วคราว</button><button id="saveSaleFinalBtn" type="submit" class="btn write-action">บันทึกยอดขายจริง</button></div>
   </form>`;
-  $("#saleDate").onchange=()=>$("#saleThaiDate").textContent=thaiDate($("#saleDate").value);
-  $("#loadSale").onclick=loadSaleDate; $("#saleClosed").onchange=toggleSaleClosed;
+  $("#saleDate").onchange=()=>{ $("#saleThaiDate").textContent=thaiDate($("#saleDate").value); };
+  $("#loadSale").onclick=()=>loadSaleDate().catch(showSaleLoadError); $("#saleClosed").onchange=toggleSaleClosed;
   ["foodSales","drinkSales","discount","cashSales","transferSales","cashOpen","ownerCashOut","cashClose"].forEach(id=>$("#"+id).addEventListener("input",recalcSale));
   $("#addExpense").onclick=()=>addExpenseRow(); $("#saveDraft").onclick=saveSaleDraft; $("#saleForm").onsubmit=saveSaleFinal;
-  await loadSaleDate();
+  bindFriendlyNumberInputs($("#saleForm"));
+  // แสดงหน้าให้ใช้ได้ทันที แล้วโหลดคำเตือน/ข้อมูลวันที่แบบไม่ขวางการเปลี่ยนหน้า
+  yesterdaySaleWarning().then(html=>{ if(pageStillActive("sales",requestId)&&$("#saleWarning")) $("#saleWarning").innerHTML=html; }).catch(err=>console.warn("yesterday warning",err));
+  loadSaleDate().catch(showSaleLoadError);
 }
+function showSaleLoadError(err){
+  console.error("sale load",err); if(state.currentPage!=="sales") return;
+  const stateEl=$("#saleState"); if(stateEl){ stateEl.textContent="โหลดไม่สำเร็จ — กดลองใหม่"; stateEl.className="pill warn"; }
+  showToast(friendlyError(err));
+}
+
 function toggleSaleClosed(){ const closed=$("#saleClosed").checked; $("#openSaleFields").classList.toggle("hidden",closed); $("#closedNoteBox").classList.toggle("hidden",!closed); }
 function expenseRowHtml(e={}){ return `<div class="expense-row panel inner-panel" data-id="${escapeHtml(e.id||uid("exp"))}"><div class="grid three"><div class="field"><label>รายการ</label><input class="expense-name" value="${escapeHtml(e.name||"")}" placeholder="เช่น ซื้อวัตถุดิบ"></div><div class="field"><label>จำนวนเงิน</label><input class="expense-amount" type="number" min="0" step="0.01" value="${numberValue(e.amount)}"></div><div class="field"><label>หมายเหตุ</label><input class="expense-note" value="${escapeHtml(e.note||"")}"></div></div><div class="flex"><label class="check-item compact-check"><input class="expense-owner-transfer" type="checkbox" ${e.ownerTransfer?"checked":""}> เจ้าของโอนเอง ไม่หักเงินสด</label><button type="button" class="btn danger small remove-expense right">ลบ</button></div></div>`; }
-function addExpenseRow(e={}){ $("#expenseRows").insertAdjacentHTML("beforeend",expenseRowHtml(e)); const row=$("#expenseRows .expense-row:last-child"); row.querySelectorAll("input").forEach(i=>i.addEventListener("input",recalcSale)); row.querySelector(".remove-expense").onclick=()=>{row.remove();recalcSale();}; }
+function addExpenseRow(e={}){ $("#expenseRows").insertAdjacentHTML("beforeend",expenseRowHtml(e)); const row=$("#expenseRows .expense-row:last-child"); row.querySelectorAll("input").forEach(i=>i.addEventListener("input",recalcSale)); bindFriendlyNumberInputs(row); row.querySelector(".remove-expense").onclick=()=>{row.remove();recalcSale();}; }
 function collectExpenses(){ return $$("#expenseRows .expense-row").map(r=>({id:r.dataset.id,name:r.querySelector(".expense-name").value.trim(),amount:numberValue(r.querySelector(".expense-amount").value),note:r.querySelector(".expense-note").value.trim(),ownerTransfer:r.querySelector(".expense-owner-transfer").checked})).filter(e=>e.name||e.amount); }
 function recalcSale(){
   const food=numberValue($("#foodSales")?.value),drink=numberValue($("#drinkSales")?.value),discount=numberValue($("#discount")?.value),cash=numberValue($("#cashSales")?.value),transfer=numberValue($("#transferSales")?.value);
@@ -460,8 +544,15 @@ function recalcSale(){
   $("#cashReasonBox")?.classList.toggle("hidden",Math.abs(diff)<0.005);
 }
 async function previousCashClose(date){
-  const months=[monthOf(date),previousMonthKey(monthOf(date))]; let rows=[]; for(const m of months) rows.push(...await docsByMonth("dailySales",m));
-  const prev=rows.filter(r=>r.date<date&&!r.closed).sort((a,b)=>String(b.date).localeCompare(String(a.date)))[0]; return prev?numberValue(prev.cashClose):0;
+  // ค้นยอดปิดกะล่าสุดที่ร้านเปิด ย้อนหลังได้ถึง 12 เดือน แต่โหลดครั้งละ 3 เดือนเพื่อลดการรอ/จำนวนครั้งอ่าน
+  let month=monthOf(date);
+  for(let batch=0;batch<4;batch++){
+    const months=[]; for(let i=0;i<3;i++){months.push(month);month=previousMonthKey(month);}
+    const groups=await Promise.all(months.map(m=>docsByMonth("dailySales",m)));
+    const prev=groups.flat().filter(r=>r.date<date&&!r.closed).sort((a,b)=>String(b.date).localeCompare(String(a.date)))[0];
+    if(prev) return numberValue(prev.cashClose);
+  }
+  return 0;
 }
 function fillSaleForm(d={}){
   const set=(id,v)=>{if($("#"+id)) $("#"+id).value=v??"";};
@@ -469,12 +560,36 @@ function fillSaleForm(d={}){
   $("#expenseRows").innerHTML=""; (d.expenses||[]).forEach(addExpenseRow); toggleSaleClosed(); recalcSale();
 }
 async function loadSaleDate(){
-  const date=$("#saleDate").value; if(!date) return; $("#saleState").textContent="กำลังโหลด";
-  const [finalSnap,draftSnap]=await Promise.all([getDoc(doc(state.db,"dailySales",date)),getDoc(doc(state.db,"dailyDrafts",date))]);
-  if(finalSnap.exists()){ state.saleLoaded={type:"final",id:date,data:finalSnap.data()}; fillSaleForm(finalSnap.data()); $("#saleState").textContent="มีข้อมูลจริง — แก้ไขได้"; }
-  else if(draftSnap.exists()){ state.saleLoaded={type:"draft",id:date,data:draftSnap.data()}; fillSaleForm(draftSnap.data()); $("#saleState").textContent="มีฉบับชั่วคราว"; }
-  else{ const open=await previousCashClose(date); state.saleLoaded=null; fillSaleForm({cashOpen:open,cashClose:open,expenses:[]}); $("#saleState").textContent="รายการใหม่"; }
+  const date=$("#saleDate")?.value; if(!date) return;
+  const seq=++state.salesLoadSeq,requestId=state.navRequestId,loadBtn=$("#loadSale"),form=$("#saleForm");
+  setButtonBusy(loadBtn,true,"กำลังโหลด..."); form?.classList.add("is-busy");
+  if($("#saleState")){ $("#saleState").textContent="กำลังโหลด"; $("#saleState").className="pill muted"; }
+  try{
+    const [finalSnap,draftSnap]=await Promise.all([
+      getDocResilient(doc(state.db,"dailySales",date),"โหลดยอดขายจริง",6500),
+      getDocResilient(doc(state.db,"dailyDrafts",date),"โหลดยอดขายชั่วคราว",6500)
+    ]);
+    if(seq!==state.salesLoadSeq||!pageStillActive("sales",requestId)||$("#saleDate")?.value!==date) return;
+    if(finalSnap.exists()){
+      state.saleLoaded={type:"final",id:date,data:finalSnap.data()}; fillSaleForm(finalSnap.data());
+      $("#saleState").textContent="มีข้อมูลจริง — แก้ไขได้"; $("#saleState").className="pill ok";
+    }else if(draftSnap.exists()){
+      state.saleLoaded={type:"draft",id:date,data:draftSnap.data()}; fillSaleForm(draftSnap.data());
+      $("#saleState").textContent="มีฉบับชั่วคราว"; $("#saleState").className="pill warn";
+    }else{
+      const open=await previousCashClose(date);
+      if(seq!==state.salesLoadSeq||!pageStillActive("sales",requestId)||$("#saleDate")?.value!==date) return;
+      state.saleLoaded=null; fillSaleForm({cashOpen:open,cashClose:open,expenses:[]});
+      $("#saleState").textContent=`รายการใหม่ · เปิดกะ ${money(open)} บาท`; $("#saleState").className="pill muted";
+    }
+    bindFriendlyNumberInputs($("#saleForm"));
+  }finally{
+    if(seq===state.salesLoadSeq&&pageStillActive("sales",requestId)){
+      form?.classList.remove("is-busy"); setButtonBusy(loadBtn,false);
+    }
+  }
 }
+
 function collectSaleData({draft=false}={}){
   const date=$("#saleDate").value,closed=$("#saleClosed").checked;
   if(closed) return {date,monthKey:monthOf(date),closed:true,note:$("#closedNote").value.trim(),foodSales:0,drinkSales:0,totalSales:0,discount:0,netIncome:0,cashSales:0,transferSales:0,beerBottles:0,cashOpen:0,cashClose:0,ownerCashOut:0,expenses:[],cashDiff:0,cashDiffReason:"",draft,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id,updatedByName:state.currentUser.name};
@@ -482,17 +597,36 @@ function collectSaleData({draft=false}={}){
   return {date,monthKey:monthOf(date),closed:false,foodSales:food,drinkSales:drink,totalSales:food+drink,discount,netIncome:food+drink-discount,cashSales:cash,transferSales:transfer,paymentDiff:cash+transfer-(food+drink-discount),beerBottles:numberValue($("#beerBottles").value),cashOpen,cashClose,ownerCashOut,expenses,cashExpenseTotal:cashExp,totalExpense:saleExpenseTotal({expenses}),cashShould,cashDiff,cashDiffReason:$("#cashDiffReason").value.trim(),note:$("#saleNote").value.trim(),draft,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id,updatedByName:state.currentUser.name};
 }
 async function saveSaleDraft(){
-  if(!requireOnline()) return; const d=collectSaleData({draft:true}); if(!d.date) return showToast("เลือกวันที่");
-  const ref=doc(state.db,"dailyDrafts",d.date),before=await getDocResilient(ref,"ตรวจฉบับชั่วคราว"); await withTimeout(setDoc(ref,d,{merge:true}),15000,"บันทึกยอดขายชั่วคราว"); await audit("บันทึกยอดขายชั่วคราว",{date:d.date},before.exists()?before.data():null,d); await afterWrite("sale_draft"); showToast("บันทึกชั่วคราวแล้ว ยังไม่รวมรายเดือน/ค่าตอบแทน"); state.saleLoaded={type:"draft",id:d.date,data:d}; $("#saleState").textContent="มีฉบับชั่วคราว";
+  if(!requireOnline()) return; const button=$("#saveDraft"); setButtonBusy(button,true,"กำลังบันทึก...");
+  try{
+    const d=collectSaleData({draft:true}); if(!d.date) return showToast("เลือกวันที่");
+    const ref=doc(state.db,"dailyDrafts",d.date),before=await getDocResilient(ref,"ตรวจฉบับชั่วคราว",6000);
+    await withTimeout(setDoc(ref,d,{merge:true}),12000,"บันทึกยอดขายชั่วคราว");
+    invalidateDataCache("dailyDrafts");
+    audit("บันทึกยอดขายชั่วคราว",{date:d.date},before.exists()?before.data():null,d).catch(console.warn);
+    afterWrite("sale_draft").catch(console.warn);
+    showToast("บันทึกชั่วคราวแล้ว ยังไม่รวมรายเดือน/ค่าตอบแทน"); state.saleLoaded={type:"draft",id:d.date,data:d};
+    if($("#saleState")){ $("#saleState").textContent="มีฉบับชั่วคราว"; $("#saleState").className="pill warn"; }
+  }catch(err){ console.error("saveSaleDraft",err); showToast(friendlyError(err)); }
+  finally{ setButtonBusy(button,false); }
 }
 async function saveSaleFinal(e){
-  e.preventDefault(); if(!requireOnline()) return; const d=collectSaleData(); if(!d.date) return showToast("เลือกวันที่");
-  if(!d.closed && d.netIncome<0) return showToast("ส่วนลดมากกว่ายอดขายไม่ได้");
-  if(!d.closed && Math.abs(d.cashDiff)>=0.005 && !d.cashDiffReason) return showToast("เงินสดไม่ตรง กรุณากรอกสาเหตุ");
-  const ref=doc(state.db,"dailySales",d.date),before=await getDocResilient(ref,"ตรวจยอดขายเดิม");
-  if(before.exists()&&!confirm(`วันที่ ${thaiDate(d.date)} มีข้อมูลแล้ว ยืนยันแก้ไขหรือไม่`)) return;
-  const batch=writeBatch(state.db); batch.set(ref,d,{merge:false}); batch.delete(doc(state.db,"dailyDrafts",d.date)); await batch.commit();
-  await audit(before.exists()?"แก้ไขยอดขาย":"บันทึกยอดขาย",{date:d.date,closed:d.closed},before.exists()?before.data():null,d); await afterWrite("sale"); showToast("บันทึกยอดขายจริงแล้ว"); state.saleLoaded={type:"final",id:d.date,data:d}; $("#saleState").textContent="มีข้อมูลจริง — แก้ไขได้";
+  e.preventDefault(); if(!requireOnline()) return; const button=e.submitter||$("#saveSaleFinalBtn"); setButtonBusy(button,true,"กำลังบันทึก...");
+  try{
+    const d=collectSaleData(); if(!d.date) return showToast("เลือกวันที่");
+    if(!d.closed&&d.netIncome<0) return showToast("ส่วนลดมากกว่ายอดขายไม่ได้");
+    if(!d.closed&&Math.abs(d.cashDiff)>=0.005&&!d.cashDiffReason) return showToast("เงินสดไม่ตรง กรุณากรอกสาเหตุ");
+    const ref=doc(state.db,"dailySales",d.date),before=await getDocResilient(ref,"ตรวจยอดขายเดิม",6000);
+    if(before.exists()&&!confirm(`วันที่ ${thaiDate(d.date)} มีข้อมูลแล้ว ยืนยันแก้ไขหรือไม่`)) return;
+    const batch=writeBatch(state.db); batch.set(ref,d,{merge:false}); batch.delete(doc(state.db,"dailyDrafts",d.date));
+    await withTimeout(batch.commit(),12000,"บันทึกยอดขายจริง");
+    invalidateDataCache("dailySales"); invalidateDataCache("dailyDrafts");
+    audit(before.exists()?"แก้ไขยอดขาย":"บันทึกยอดขาย",{date:d.date,closed:d.closed},before.exists()?before.data():null,d).catch(console.warn);
+    afterWrite("sale").catch(console.warn);
+    showToast("บันทึกยอดขายจริงแล้ว"); state.saleLoaded={type:"final",id:d.date,data:d};
+    if($("#saleState")){ $("#saleState").textContent="มีข้อมูลจริง — แก้ไขได้"; $("#saleState").className="pill ok"; }
+  }catch(err){ console.error("saveSaleFinal",err); showToast(friendlyError(err)); }
+  finally{ setButtonBusy(button,false); }
 }
 
 /* ------------------------------ ลงวันทำงาน ------------------------------ */
@@ -521,75 +655,160 @@ async function renderAttendance(){
   if(!canViewAll&&!worker) return content().innerHTML=`<div class="state error">ไม่มีสิทธิ์</div>`;
   const first=canViewAll?state.users.find(u=>u.active!==false&&WORKER_ROLES.includes(u.role)):state.currentUser;
   content().innerHTML=`${pageTitle("ลงวันทำงาน",canViewAll?"ตรวจสอบการลงวันทำงานของพนักงานทุกคน":"เห็นเฉพาะข้อมูลของตัวเอง")}
-    <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="attMonth" type="month" value="${currentMonthKey()}"></div><div class="field"><label>พนักงาน</label><select id="attUser" ${canViewAll?"":"disabled"}>${canViewAll?workerOptions(first?.id):`<option value="${state.currentUser.id}">${escapeHtml(state.currentUser.name)}</option>`}</select></div><div class="field"><label>&nbsp;</label><button id="loadAttendance" class="btn secondary">โหลดข้อมูล</button></div></div></div>
-    <div id="attFormBox">${(worker||canAdminEdit)&&first?attendanceFormHtml(first):`<div class="state ok">หัวหน้าดูข้อมูลได้ แต่ไม่ต้องลงวันทำงานของตนเอง</div>`}</div><div id="attResult"></div>`;
-  $("#loadAttendance").onclick=()=>refreshAttendancePage().catch(e=>showToast(friendlyError(e))); $("#attMonth").onchange=()=>loadAttendanceResult().catch(e=>showToast(friendlyError(e))); $("#attUser").onchange=()=>refreshAttendancePage().catch(e=>showToast(friendlyError(e)));
-  await bindAttendanceForm(); await loadAttendanceResult();
+    <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="attMonth" type="month" value="${currentMonthKey()}"></div><div class="field"><label>พนักงาน</label><select id="attUser" ${canViewAll?"":"disabled"}>${canViewAll?workerOptions(first?.id):`<option value="${state.currentUser.id}">${escapeHtml(state.currentUser.name)}</option>`}</select></div><div class="field"><label>&nbsp;</label><button id="loadAttendance" type="button" class="btn secondary">โหลดข้อมูล</button></div></div></div>
+    <div id="attFormBox">${(worker||canAdminEdit)&&first?attendanceFormHtml(first):`<div class="state ok">หัวหน้าดูข้อมูลได้ แต่ไม่ต้องลงวันทำงานของตนเอง</div>`}</div><div id="attResult"><div class="loading">กำลังโหลดรายการ...</div></div>`;
+  const requestId=state.navRequestId;
+  $("#loadAttendance").onclick=()=>refreshAttendancePage().catch(showAttendanceError);
+  $("#attMonth").onchange=()=>loadAttendanceResult().catch(showAttendanceError);
+  $("#attUser").onchange=()=>refreshAttendancePage().catch(showAttendanceError);
+  bindFriendlyNumberInputs(content());
+  // ไม่บล็อกการเปิดหน้า: แบบฟอร์มและรายการโหลดแยกกันโดยมีเลขลำดับคนละชุด
+  bindAttendanceForm().catch(showAttendanceError);
+  loadAttendanceResult().catch(showAttendanceError);
+  if(!pageStillActive("attendance",requestId)) return;
+}
+function showAttendanceError(err){
+  console.error("attendance",err);
+  if(state.currentPage!=="attendance") return;
+  const box=$("#attResult");
+  if(box && box.querySelector(".loading")) box.innerHTML=`<div class="state error"><b>โหลดรายการไม่สำเร็จ</b><br>${escapeHtml(friendlyError(err))}<div style="margin-top:10px"><button id="retryAttendance" type="button" class="btn secondary">ลองใหม่</button></div></div>`;
+  $("#retryAttendance")&&($("#retryAttendance").onclick=()=>loadAttendanceResult().catch(showAttendanceError));
+  showToast(friendlyError(err));
 }
 function selectedAttendanceUser(){ return state.users.find(u=>u.id===$("#attUser")?.value)||state.currentUser; }
 async function bindAttendanceForm(){
   const form=$("#attendanceForm"); if(!form) return;
-  $("#attDate").onchange=async()=>{ $("#attThaiDate").textContent=thaiDate($("#attDate").value); try{await loadAttendanceIntoForm();}catch(e){showToast(friendlyError(e));} };
-  $("#attStatus").onchange=updateAttendanceFields; $("#workStore")&&($("#workStore").onchange=updateAttendanceFields); $("#hasOT")&&($("#hasOT").onchange=updateAttendanceFields);
-  form.onsubmit=saveAttendance; updateAttendanceFields(); await loadAttendanceIntoForm();
+  const dateInput=$("#attDate"),status=$("#attStatus");
+  dateInput.onchange=()=>{
+    const label=$("#attThaiDate"); if(label) label.textContent=thaiDate(dateInput.value);
+    loadAttendanceIntoForm().catch(showAttendanceError);
+  };
+  status.onchange=updateAttendanceFields;
+  $("#workStore")&&($("#workStore").onchange=updateAttendanceFields);
+  $("#hasOT")&&($("#hasOT").onchange=updateAttendanceFields);
+  form.onsubmit=saveAttendance;
+  updateAttendanceFields();
+  bindFriendlyNumberInputs(form);
+  await loadAttendanceIntoForm();
 }
 async function refreshAttendancePage(){
-  const user=selectedAttendanceUser(); const canEdit=isOwnerOrManager()||user.id===state.currentUser.id;
-  $("#attFormBox").innerHTML=canEdit?attendanceFormHtml(user):`<div class="state ok">หัวหน้าดูข้อมูลของ ${escapeHtml(user.name)} ได้ แต่การแก้ไขให้เจ้าของหรือผู้จัดการดำเนินการ</div>`;
-  await bindAttendanceForm(); await loadAttendanceResult();
+  const pageRequest=state.navRequestId,user=selectedAttendanceUser(); if(!user||state.currentPage!=="attendance") return;
+  const canEdit=isOwnerOrManager()||user.id===state.currentUser.id,box=$("#attFormBox"); if(!box) return;
+  // ยกเลิกเฉพาะงานโหลดแบบฟอร์มเก่า ไม่แตะงานโหลดรายการ
+  state.attendanceFormLoadSeq++;
+  box.innerHTML=canEdit?attendanceFormHtml(user):`<div class="state ok">หัวหน้าดูข้อมูลของ ${escapeHtml(user.name)} ได้ แต่การแก้ไขให้เจ้าของหรือผู้จัดการดำเนินการ</div>`;
+  bindFriendlyNumberInputs(box);
+  const jobs=[]; if(canEdit) jobs.push(bindAttendanceForm()); jobs.push(loadAttendanceResult());
+  await Promise.allSettled(jobs);
+  if(!pageStillActive("attendance",pageRequest)) return;
 }
 function updateAttendanceFields(){
-  const user=selectedAttendanceUser(),status=$("#attStatus")?.value;
+  const user=selectedAttendanceUser(),status=$("#attStatus")?.value; if(!user) return;
   $("#attReasonBox")?.classList.toggle("hidden",!attendanceReasonRequired(status));
   $("#dailyHourBox")?.classList.toggle("hidden",!(user.role==="daily"&&status==="hourly"));
   $("#rotatingBox")?.classList.toggle("hidden",!(user.role==="rotating"&&status==="full_day"));
   const mayOT=["front_kitchen","back_kitchen","front_staff","rotating"].includes(user.role)&&status==="full_day";
   $("#otBox")?.classList.toggle("hidden",!mayOT); const has=mayOT&&$("#hasOT")?.checked; $("#otTimeBox")?.classList.toggle("hidden",!has);
-  if(mayOT){ const startHour=user.role==="rotating"&&$("#workStore")?.value==="Love Matcha"?18:22; const currentStart=$("#otStart")?.value,currentEnd=$("#otEnd")?.value; $("#otStart").innerHTML=timeOptions(startHour,24,currentStart||`${String(startHour).padStart(2,"0")}:00`); $("#otEnd").innerHTML=timeOptions(startHour,24,currentEnd||`${String(Math.min(startHour+1,24)).padStart(2,"0")}:00`); $("#otHint").textContent=`เลือกเวลาได้ทีละ 1 ชั่วโมง ตั้งแต่ ${String(startHour).padStart(2,"0")}:00–24:00`; }
+  if(mayOT&&$("#otStart")&&$("#otEnd")){
+    const startHour=user.role==="rotating"&&$("#workStore")?.value==="Love Matcha"?18:22;
+    const currentStart=$("#otStart").value,currentEnd=$("#otEnd").value;
+    $("#otStart").innerHTML=timeOptions(startHour,24,currentStart||`${String(startHour).padStart(2,"0")}:00`);
+    $("#otEnd").innerHTML=timeOptions(startHour,24,currentEnd||`${String(Math.min(startHour+1,24)).padStart(2,"0")}:00`);
+    $("#otHint").textContent=`เลือกเวลาได้ทีละ 1 ชั่วโมง ตั้งแต่ ${String(startHour).padStart(2,"0")}:00–24:00`;
+  }
+}
+function resetAttendanceFormDefaults(){
+  if(!$("#attendanceForm")) return;
+  $("#attStatus").value="full_day"; $("#attReason").value="";
+  if($("#attStart")) $("#attStart").value="11:00"; if($("#attEnd")) $("#attEnd").value="12:00";
+  if($("#workStore")) $("#workStore").value="Rendo"; if($("#hasOT")) $("#hasOT").checked=false;
+  updateAttendanceFields();
 }
 async function loadAttendanceIntoForm(){
-  const form=$("#attendanceForm"); if(!form) return; const user=selectedAttendanceUser(),date=$("#attDate").value,seq=++state.attendanceLoadSeq;
-  form.classList.add("is-busy");
+  const form=$("#attendanceForm"),user=selectedAttendanceUser(),date=$("#attDate")?.value;
+  if(!form||!user||!date) return;
+  const seq=++state.attendanceFormLoadSeq,requestId=state.navRequestId,button=form.querySelector('button[type="submit"]');
+  let statusLine=form.querySelector(".att-record-state");
+  if(!statusLine){ statusLine=document.createElement("div");statusLine.className="att-record-state loading-inline";form.querySelector("h3")?.insertAdjacentElement("afterend",statusLine); }
+  statusLine.textContent="กำลังตรวจข้อมูลวันที่นี้..."; statusLine.className="att-record-state loading-inline";
+  if(button) button.disabled=true;
   try{
-    const snap=await getDocResilient(doc(state.db,"attendance",`${user.id}_${date}`),"โหลดวันทำงาน");
-    if(seq!==state.attendanceLoadSeq||state.currentPage!=="attendance"||!$("#attendanceForm")) return;
-    if(!snap.exists()){ $("#attStatus").value="full_day"; $("#attReason").value=""; if($("#workStore")) $("#workStore").value="Rendo"; if($("#hasOT")) $("#hasOT").checked=false; updateAttendanceFields(); return; }
-    const d=snap.data(); $("#attStatus").value=d.status||"full_day"; $("#attReason").value=d.reason||""; if($("#attStart")) $("#attStart").value=d.startTime||"11:00"; if($("#attEnd")) $("#attEnd").value=d.endTime||"12:00"; if($("#workStore")) $("#workStore").value=d.workStore||"Rendo"; if($("#hasOT")) $("#hasOT").checked=!!d.hasOT; updateAttendanceFields(); if($("#otStart")) $("#otStart").value=d.otStart||$("#otStart").value; if($("#otEnd")) $("#otEnd").value=d.otEnd||$("#otEnd").value;
-  }finally{if(seq===state.attendanceLoadSeq) $("#attendanceForm")?.classList.remove("is-busy");}
+    const snap=await getDocResilient(doc(state.db,"attendance",`${user.id}_${date}`),"โหลดวันทำงาน",6000);
+    if(seq!==state.attendanceFormLoadSeq||!pageStillActive("attendance",requestId)||!$("#attendanceForm")) return;
+    if(!snap.exists()){
+      resetAttendanceFormDefaults(); statusLine.textContent="ยังไม่มีข้อมูลวันที่นี้ — พร้อมบันทึก"; statusLine.className="att-record-state ok-inline"; return;
+    }
+    const d=snap.data();
+    $("#attStatus").value=d.status||"full_day"; $("#attReason").value=d.reason||"";
+    if($("#attStart")) $("#attStart").value=d.startTime||"11:00"; if($("#attEnd")) $("#attEnd").value=d.endTime||"12:00";
+    if($("#workStore")) $("#workStore").value=d.workStore||"Rendo"; if($("#hasOT")) $("#hasOT").checked=!!d.hasOT;
+    updateAttendanceFields(); if($("#otStart")) $("#otStart").value=d.otStart||$("#otStart").value; if($("#otEnd")) $("#otEnd").value=d.otEnd||$("#otEnd").value;
+    statusLine.textContent="พบข้อมูลเดิม — แก้ไขแล้วกดบันทึกได้"; statusLine.className="att-record-state warn-inline";
+  }catch(err){
+    if(seq!==state.attendanceFormLoadSeq||!pageStillActive("attendance",requestId)) return;
+    statusLine.textContent=`โหลดข้อมูลเดิมไม่สำเร็จ: ${friendlyError(err)}`; statusLine.className="att-record-state error-inline";
+    throw err;
+  }finally{
+    if(seq===state.attendanceFormLoadSeq&&pageStillActive("attendance",requestId)&&button) button.disabled=!state.online;
+  }
 }
 async function saveAttendance(e){
-  e.preventDefault(); if(!requireOnline()) return; const button=e.submitter||e.currentTarget.querySelector("button[type=submit]"); setButtonBusy(button,true,"กำลังบันทึก...");
+  e.preventDefault(); if(!requireOnline()) return;
+  const button=e.submitter||e.currentTarget.querySelector("button[type=submit]"); setButtonBusy(button,true,"กำลังบันทึก...");
   try{
-    const user=selectedAttendanceUser(); if(!(isOwnerOrManager()||user.id===state.currentUser.id)) return showToast("ไม่มีสิทธิ์แก้ไข");
-    const date=$("#attDate").value,status=$("#attStatus").value,reason=$("#attReason").value.trim(); if(!date) return showToast("เลือกวันที่"); if(attendanceReasonRequired(status)&&!reason) return showToast("กรุณาระบุสาเหตุ");
+    const user=selectedAttendanceUser(); if(!user) return showToast("ไม่พบพนักงาน");
+    if(!(isOwnerOrManager()||user.id===state.currentUser.id)) return showToast("ไม่มีสิทธิ์แก้ไข");
+    const date=$("#attDate")?.value,status=$("#attStatus")?.value,reason=$("#attReason")?.value.trim()||"";
+    if(!date) return showToast("เลือกวันที่"); if(attendanceReasonRequired(status)&&!reason) return showToast("กรุณาระบุสาเหตุ");
     const d={userId:user.id,userName:user.name,role:user.role,date,monthKey:monthOf(date),status,reason,workStore:"",startTime:"",endTime:"",hasOT:false,otStart:"",otEnd:"",otHours:0,paidDaily:false,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id,updatedByName:state.currentUser.name};
-    const ref=doc(state.db,"attendance",`${user.id}_${date}`),existing=await getDocResilient(ref,"ตรวจข้อมูลวันทำงาน"); if(existing.exists()) d.paidDaily=!!existing.data().paidDaily;
-    if(user.role==="daily"&&status==="hourly"){ d.startTime=$("#attStart").value; d.endTime=$("#attEnd").value; if(minutesFromTime(d.endTime)<=minutesFromTime(d.startTime)) return showToast("เวลาเลิกงานต้องมากกว่าเวลาเริ่ม"); }
+    const ref=doc(state.db,"attendance",`${user.id}_${date}`),existing=await getDocResilient(ref,"ตรวจข้อมูลวันทำงาน",6000); if(existing.exists()) d.paidDaily=!!existing.data().paidDaily;
+    if(user.role==="daily"&&status==="hourly"){
+      d.startTime=$("#attStart").value; d.endTime=$("#attEnd").value;
+      if(minutesFromTime(d.endTime)<=minutesFromTime(d.startTime)) return showToast("เวลาเลิกงานต้องมากกว่าเวลาเริ่ม");
+    }
     if(user.role==="rotating"&&status==="full_day") d.workStore=$("#workStore").value;
-    if(["front_kitchen","back_kitchen","front_staff","rotating"].includes(user.role)&&status==="full_day"&&$("#hasOT")?.checked){ d.hasOT=true; d.otStart=$("#otStart").value; d.otEnd=$("#otEnd").value; if(minutesFromTime(d.otEnd)<=minutesFromTime(d.otStart)) return showToast("เวลาเลิก OT ต้องมากกว่าเวลาเริ่ม"); d.otHours=(minutesFromTime(d.otEnd)-minutesFromTime(d.otStart))/60; }
-    await withTimeout(setDoc(ref,d,{merge:false}),15000,"บันทึกวันทำงาน");
+    if(["front_kitchen","back_kitchen","front_staff","rotating"].includes(user.role)&&status==="full_day"&&$("#hasOT")?.checked){
+      d.hasOT=true; d.otStart=$("#otStart").value; d.otEnd=$("#otEnd").value;
+      if(minutesFromTime(d.otEnd)<=minutesFromTime(d.otStart)) return showToast("เวลาเลิก OT ต้องมากกว่าเวลาเริ่ม");
+      d.otHours=(minutesFromTime(d.otEnd)-minutesFromTime(d.otStart))/60;
+    }
+    await withTimeout(setDoc(ref,d,{merge:false}),12000,"บันทึกวันทำงาน");
+    invalidateDataCache("attendance");
     showToast("บันทึกวันทำงานแล้ว");
     audit(existing.exists()?"แก้ไขวันทำงาน":"ลงวันทำงาน",{user:user.name,date,status:attendanceStatusLabel(status)},existing.exists()?existing.data():null,d).catch(console.warn);
     afterWrite("attendance").catch(console.warn);
-    try{await loadAttendanceResult();}catch(err){console.warn(err);showToast("บันทึกแล้ว แต่โหลดรายการใหม่ไม่สำเร็จ กดโหลดข้อมูลอีกครั้งได้");}
-  }catch(err){console.error("saveAttendance",err);showToast(friendlyError(err));}
-  finally{setButtonBusy(button,false);}
+    loadAttendanceResult({force:true}).catch(err=>{console.warn(err);showToast("บันทึกแล้ว แต่โหลดรายการใหม่ไม่สำเร็จ กดโหลดข้อมูลอีกครั้งได้");});
+    loadAttendanceIntoForm().catch(console.warn);
+  }catch(err){ console.error("saveAttendance",err); showToast(friendlyError(err)); }
+  finally{ setButtonBusy(button,false); }
 }
-
-async function loadAttendanceResult(){
-  const month=$("#attMonth")?.value||currentMonthKey(),user=selectedAttendanceUser(); if(!user) return;
-  const seq=++state.attendanceLoadSeq; $("#attResult").innerHTML=`<div class="loading">กำลังโหลด...</div>`; const rows=(await docsByMonth("attendance",month)).filter(r=>r.userId===user.id).sort((a,b)=>String(a.date).localeCompare(String(b.date))); if(seq!==state.attendanceLoadSeq||state.currentPage!=="attendance"||!$("#attResult")) return;
-  const missing=missingAttendanceDates(month,rows); const summary={full:rows.filter(r=>r.status==="full_day").length,hourly:rows.filter(r=>r.status==="hourly").length,off:rows.filter(r=>r.status==="off").length,leave:rows.filter(r=>["vacation","sick","personal","other"].includes(r.status)).length,ot:rows.reduce((s,r)=>s+numberValue(r.otHours),0)};
-  $("#attResult").innerHTML=`${missing.length?`<div class="state warn"><b>ยังไม่ได้ลงวันที่:</b> ${missing.map(d=>Number(d.slice(8))).join(", ")}</div>`:`<div class="state ok">ลงข้อมูลครบตามวันที่ผ่านมาแล้ว</div>`}
-  ${metricCards([{label:"ทำงานทั้งวัน",value:`${summary.full} วัน`},{label:"รายชั่วโมง",value:`${summary.hourly} วัน`},{label:"หยุด",value:`${summary.off} วัน`},{label:"ลา/อื่น ๆ",value:`${summary.leave} วัน`},{label:"OT",value:`${money(summary.ot)} ชม.`}])}
-  <div class="panel"><h3>รายการ ${thaiMonth(month)}</h3>${rows.length?`<div class="table-wrap"><table class="mobile-card-table"><thead><tr><th>วันที่</th><th>สถานะ</th><th>ร้าน/เวลา</th><th>OT</th><th>สาเหตุ</th></tr></thead><tbody>${rows.map(r=>`<tr><td data-label="วันที่">${thaiDate(r.date)}</td><td data-label="สถานะ">${attendanceStatusLabel(r.status)}</td><td data-label="ร้าน/เวลา">${r.status==="hourly"?`${r.startTime}–${r.endTime}`:(r.workStore||"-")}</td><td data-label="OT">${r.hasOT?`${r.otStart}–${r.otEnd} (${money(r.otHours)} ชม.)`:"-"}</td><td data-label="สาเหตุ">${escapeHtml(r.reason||"")}</td></tr>`).join("")}</tbody></table></div>`:`<div class="empty">ยังไม่มีข้อมูล</div>`}</div>`;
+async function loadAttendanceResult({force=false}={}){
+  const result=$("#attResult"),month=$("#attMonth")?.value||currentMonthKey(),user=selectedAttendanceUser(); if(!result||!user) return;
+  const seq=++state.attendanceResultLoadSeq,requestId=state.navRequestId;
+  result.innerHTML=`<div class="loading">กำลังโหลดรายการ...</div>`;
+  try{
+    // โหลดเฉพาะพนักงานที่เลือก ลดจำนวนข้อมูลและไม่แย่งกับการโหลดแบบฟอร์ม
+    const rows=(await docsByMonthForUser("attendance",month,user.id,{force})).sort((a,b)=>String(a.date).localeCompare(String(b.date)));
+    if(seq!==state.attendanceResultLoadSeq||!pageStillActive("attendance",requestId)||!$("#attResult")) return;
+    const missing=missingAttendanceDates(month,rows);
+    const summary={full:rows.filter(r=>r.status==="full_day").length,hourly:rows.filter(r=>r.status==="hourly").length,off:rows.filter(r=>r.status==="off").length,leave:rows.filter(r=>["vacation","sick","personal","other"].includes(r.status)).length,ot:rows.reduce((sum,r)=>sum+numberValue(r.otHours),0)};
+    $("#attResult").innerHTML=`${missing.length?`<div class="state warn"><b>ยังไม่ได้ลงวันที่:</b> ${missing.map(d=>Number(d.slice(8))).join(", ")}</div>`:`<div class="state ok">ลงข้อมูลครบตามวันที่ผ่านมาแล้ว</div>`}
+      ${metricCards([{label:"ทำงานทั้งวัน",value:`${summary.full} วัน`},{label:"รายชั่วโมง",value:`${summary.hourly} วัน`},{label:"หยุด",value:`${summary.off} วัน`},{label:"ลา/อื่น ๆ",value:`${summary.leave} วัน`},{label:"OT",value:`${money(summary.ot)} ชม.`}])}
+      <div class="panel"><h3>รายการ ${thaiMonth(month)}</h3>${rows.length?`<div class="table-wrap"><table class="mobile-card-table"><thead><tr><th>วันที่</th><th>สถานะ</th><th>ร้าน/เวลา</th><th>OT</th><th>สาเหตุ</th></tr></thead><tbody>${rows.map(r=>`<tr><td data-label="วันที่">${thaiDate(r.date)}</td><td data-label="สถานะ">${attendanceStatusLabel(r.status)}</td><td data-label="ร้าน/เวลา">${r.status==="hourly"?`${escapeHtml(r.startTime)}–${escapeHtml(r.endTime)}`:escapeHtml(r.workStore||"-")}</td><td data-label="OT">${r.hasOT?`${escapeHtml(r.otStart)}–${escapeHtml(r.otEnd)} (${money(r.otHours)} ชม.)`:"-"}</td><td data-label="สาเหตุ">${escapeHtml(r.reason||"")}</td></tr>`).join("")}</tbody></table></div>`:`<div class="empty">ยังไม่มีข้อมูล</div>`}</div>`;
+  }catch(err){
+    if(seq!==state.attendanceResultLoadSeq||!pageStillActive("attendance",requestId)||!$("#attResult")) return;
+    $("#attResult").innerHTML=`<div class="state error"><b>โหลดรายการไม่สำเร็จ</b><br>${escapeHtml(friendlyError(err))}<div style="margin-top:10px"><button id="retryAttendance" type="button" class="btn secondary">ลองใหม่</button></div></div>`;
+    $("#retryAttendance").onclick=()=>loadAttendanceResult({force:true}).catch(showAttendanceError);
+    throw err;
+  }
 }
 
 /* -------------------------------- รายเดือน -------------------------------- */
 async function renderMonthly(){
   const month=currentMonthKey(); content().innerHTML=`${pageTitle("รายเดือน","สรุปพนักงานที่ทำงานทั้งวัน ยอดขาย และเงินสดรายวัน")}
   <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="monthlyMonth" type="month" value="${month}" ${isAdminViewer()?"":`min="${previousMonthKey()}" max="${currentMonthKey()}"`}></div><div class="field"><label>&nbsp;</label><button id="loadMonthly" class="btn secondary">แสดงรายเดือน</button></div><div class="field"><label>&nbsp;</label><span class="pill muted">ดูย้อนหลัง ${isAdminViewer()?"ได้ตลอด":"ไม่เกิน 1 เดือนก่อนหน้า"}</span></div></div></div><div id="monthlyResult"></div>`;
-  $("#loadMonthly").onclick=()=>loadMonthly().catch(e=>showToast(friendlyError(e))); $("#monthlyMonth").onchange=()=>loadMonthly().catch(e=>showToast(friendlyError(e))); await loadMonthly();
+  const fail=e=>{console.error("monthly",e);if(state.currentPage==="monthly"&&$("#monthlyResult"))$("#monthlyResult").innerHTML=`<div class="state error"><b>โหลดรายเดือนไม่สำเร็จ</b><br>${escapeHtml(friendlyError(e))}</div>`;showToast(friendlyError(e));};
+  $("#loadMonthly").onclick=()=>loadMonthly().catch(fail); $("#monthlyMonth").onchange=()=>loadMonthly().catch(fail); loadMonthly().catch(fail);
 }
 async function loadMonthly(){
   const month=$("#monthlyMonth")?.value; if(!month)return; if(!isAdminViewer()&&month<previousMonthKey()) return showToast("พนักงานดูย้อนหลังได้ไม่เกิน 1 เดือนก่อนหน้า");
@@ -616,22 +835,36 @@ async function renderAdvances(){
   if(!canAccessAdvances()) return content().innerHTML=`<div class="state error">เจ้าของยังไม่ได้เปิดสิทธิ์หน้านี้</div>`;
   const admin=isOwnerOrManager(),selected=admin?(state.users.find(u=>u.active!==false&&WORKER_ROLES.includes(u.role))?.id||""):state.currentUser.id;
   content().innerHTML=`${pageTitle("เบิกเงินล่วงหน้า","เก็บวันที่ จำนวนเงิน และประวัติการเบิก")}
-  <form id="advanceForm" class="panel"><h3>เพิ่มรายการ</h3><div class="grid four"><div class="field"><label>พนักงาน</label><select id="advanceUser" ${admin?"":"disabled"}>${admin?workerOptions(selected):`<option value="${state.currentUser.id}">${escapeHtml(state.currentUser.name)}</option>`}</select></div><div class="field"><label>วันที่</label><input id="advanceDate" type="date" value="${todayISO()}"></div><div class="field"><label>จำนวนเงิน</label><input id="advanceAmount" type="number" min="0" step="0.01" required></div><div class="field"><label>หมายเหตุ</label><input id="advanceNote" placeholder="ถ้ามี"></div></div><button class="btn write-action">บันทึกการเบิก</button></form>
-  <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="advanceMonth" type="month" value="${currentMonthKey()}"></div><div class="field"><label>กรองพนักงาน</label><select id="advanceFilter" ${admin?"":"disabled"}>${admin?`<option value="ALL">ทุกคน</option>${workerOptions("")}`:`<option value="${state.currentUser.id}">${escapeHtml(state.currentUser.name)}</option>`}</select></div><div class="field"><label>&nbsp;</label><button id="loadAdvances" class="btn secondary">โหลด</button></div></div><div id="advanceResult"></div></div>`;
-  $("#advanceForm").onsubmit=saveAdvance; $("#loadAdvances").onclick=loadAdvances; $("#advanceMonth").onchange=loadAdvances; $("#advanceFilter").onchange=loadAdvances; await loadAdvances();
+  <form id="advanceForm" class="panel"><h3>เพิ่มรายการ</h3><div class="grid four"><div class="field"><label>พนักงาน</label><select id="advanceUser" ${admin?"":"disabled"}>${admin?workerOptions(selected):`<option value="${state.currentUser.id}">${escapeHtml(state.currentUser.name)}</option>`}</select></div><div class="field"><label>วันที่</label><input id="advanceDate" type="date" value="${todayISO()}"></div><div class="field"><label>จำนวนเงิน</label><input id="advanceAmount" type="number" min="0" step="0.01" value="0" required></div><div class="field"><label>หมายเหตุ</label><input id="advanceNote" placeholder="ถ้ามี"></div></div><button class="btn write-action">บันทึกการเบิก</button></form>
+  <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="advanceMonth" type="month" value="${currentMonthKey()}"></div><div class="field"><label>กรองพนักงาน</label><select id="advanceFilter" ${admin?"":"disabled"}>${admin?`<option value="ALL">ทุกคน</option>${workerOptions("")}`:`<option value="${state.currentUser.id}">${escapeHtml(state.currentUser.name)}</option>`}</select></div><div class="field"><label>&nbsp;</label><button id="loadAdvances" type="button" class="btn secondary">โหลด</button></div></div><div id="advanceResult"><div class="loading">กำลังโหลด...</div></div></div>`;
+  const fail=e=>{console.error("advances",e);if(state.currentPage==="advances"&&$("#advanceResult"))$("#advanceResult").innerHTML=`<div class="state error">${escapeHtml(friendlyError(e))}</div>`;showToast(friendlyError(e));};
+  $("#advanceForm").onsubmit=saveAdvance; $("#loadAdvances").onclick=()=>loadAdvances().catch(fail); $("#advanceMonth").onchange=()=>loadAdvances().catch(fail); $("#advanceFilter").onchange=()=>loadAdvances().catch(fail);
+  bindFriendlyNumberInputs($("#advanceForm")); loadAdvances().catch(fail);
 }
 async function saveAdvance(e){
-  e.preventDefault(); if(!requireOnline()) return; const user=state.users.find(u=>u.id===$("#advanceUser").value),date=$("#advanceDate").value,amount=numberValue($("#advanceAmount").value),note=$("#advanceNote").value.trim();
-  if(!user||!date||amount<=0) return showToast("กรอกข้อมูลให้ครบ"); const d={userId:user.id,userName:user.name,date,monthKey:monthOf(date),amount,note,createdBy:state.currentUser.id,createdByName:state.currentUser.name,createdAt:serverTimestamp(),createdAtISO:new Date().toISOString()};
-  const ref=await addDoc(collection(state.db,"salaryAdvances"),d); await audit("บันทึกเบิกเงินล่วงหน้า",{user:user.name,date,amount},null,{id:ref.id,...d}); await afterWrite("advance"); $("#advanceAmount").value=""; $("#advanceNote").value=""; showToast("บันทึกแล้ว"); await loadAdvances();
+  e.preventDefault(); if(!requireOnline()) return; const button=e.submitter||e.currentTarget.querySelector('button[type="submit"]');setButtonBusy(button,true,"กำลังบันทึก...");
+  try{
+    const user=state.users.find(u=>u.id===$("#advanceUser")?.value),date=$("#advanceDate")?.value,amount=numberValue($("#advanceAmount")?.value),note=$("#advanceNote")?.value.trim()||"";
+    if(!user||!date||amount<=0) return showToast("กรอกข้อมูลให้ครบ");
+    const d={userId:user.id,userName:user.name,date,monthKey:monthOf(date),amount,note,createdBy:state.currentUser.id,createdByName:state.currentUser.name,createdAt:serverTimestamp(),createdAtISO:new Date().toISOString()};
+    const ref=await withTimeout(addDoc(collection(state.db,"salaryAdvances"),d),12000,"บันทึกเงินเบิกล่วงหน้า");
+    invalidateDataCache("salaryAdvances"); audit("บันทึกเบิกเงินล่วงหน้า",{user:user.name,date,amount},null,{id:ref.id,...d}).catch(console.warn); afterWrite("advance").catch(console.warn);
+    $("#advanceAmount").value="0"; $("#advanceNote").value=""; showToast("บันทึกแล้ว"); loadAdvances({force:true}).catch(console.warn);
+  }catch(err){console.error("saveAdvance",err);showToast(friendlyError(err));}
+  finally{setButtonBusy(button,false);}
 }
-async function loadAdvances(){
-  const month=$("#advanceMonth").value,filter=$("#advanceFilter").value;
-  let rows=isOwnerOrManager()?await docsByMonth("salaryAdvances",month):await docsByMonthForUser("salaryAdvances",month,state.currentUser.id);
+async function loadAdvances({force=false}={}){
+  const result=$("#advanceResult"),month=$("#advanceMonth")?.value,filter=$("#advanceFilter")?.value;if(!result||!month)return;
+  const seq=++state.advancesLoadSeq,requestId=state.navRequestId;result.innerHTML=`<div class="loading">กำลังโหลด...</div>`;
+  let rows=isOwnerOrManager()?await docsByMonth("salaryAdvances",month,{force}):await docsByMonthForUser("salaryAdvances",month,state.currentUser.id,{force});
+  if(seq!==state.advancesLoadSeq||!pageStillActive("advances",requestId)||!$("#advanceResult"))return;
   if(isOwnerOrManager()&&filter!=="ALL") rows=rows.filter(r=>r.userId===filter);
   rows.sort((a,b)=>String(b.date).localeCompare(String(a.date)));
-  const total=rows.reduce((s,x)=>s+numberValue(x.amount),0); $("#advanceResult").innerHTML=`${metricCards([{label:"ยอดเบิกรวม",value:`${money(total)} บาท`},{label:"จำนวนรายการ",value:`${rows.length} รายการ`}])}${rows.length?`<div class="table-wrap"><table class="mobile-card-table"><thead><tr><th>วันที่</th><th>พนักงาน</th><th class="money">จำนวน</th><th>หมายเหตุ</th><th>ผู้บันทึก</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td data-label="วันที่">${thaiDate(r.date)}</td><td data-label="พนักงาน">${escapeHtml(r.userName)}</td><td data-label="จำนวน" class="money">${money(r.amount)}</td><td data-label="หมายเหตุ">${escapeHtml(r.note||"")}</td><td data-label="ผู้บันทึก">${escapeHtml(r.createdByName||"")}</td><td data-label="จัดการ">${isOwnerOrManager()||r.createdBy===state.currentUser.id?`<button class="btn danger small delete-advance" data-id="${r.id}">ลบ</button>`:"-"}</td></tr>`).join("")}</tbody></table></div>`:`<div class="empty">ยังไม่มีรายการ</div>`}`;
-  $$(".delete-advance").forEach(b=>b.onclick=async()=>{ if(!requireOnline()||!confirm("ยืนยันลบรายการเบิกเงินนี้"))return; const row=rows.find(x=>x.id===b.dataset.id); await deleteDoc(doc(state.db,"salaryAdvances",b.dataset.id)); await audit("ลบรายการเบิกเงิน",{user:row?.userName,date:row?.date,amount:row?.amount},row,null); await afterWrite("delete_advance"); await loadAdvances(); });
+  const total=rows.reduce((sum,x)=>sum+numberValue(x.amount),0); $("#advanceResult").innerHTML=`${metricCards([{label:"ยอดเบิกรวม",value:`${money(total)} บาท`},{label:"จำนวนรายการ",value:`${rows.length} รายการ`}])}${rows.length?`<div class="table-wrap"><table class="mobile-card-table"><thead><tr><th>วันที่</th><th>พนักงาน</th><th class="money">จำนวน</th><th>หมายเหตุ</th><th>ผู้บันทึก</th><th></th></tr></thead><tbody>${rows.map(r=>`<tr><td data-label="วันที่">${thaiDate(r.date)}</td><td data-label="พนักงาน">${escapeHtml(r.userName)}</td><td data-label="จำนวน" class="money">${money(r.amount)}</td><td data-label="หมายเหตุ">${escapeHtml(r.note||"")}</td><td data-label="ผู้บันทึก">${escapeHtml(r.createdByName||"")}</td><td data-label="จัดการ">${isOwnerOrManager()||r.createdBy===state.currentUser.id?`<button class="btn danger small delete-advance" data-id="${r.id}">ลบ</button>`:"-"}</td></tr>`).join("")}</tbody></table></div>`:`<div class="empty">ยังไม่มีรายการ</div>`}`;
+  $$(".delete-advance").forEach(b=>b.onclick=async()=>{
+    if(!requireOnline()||!confirm("ยืนยันลบรายการเบิกเงินนี้"))return; const row=rows.find(x=>x.id===b.dataset.id);
+    try{await withTimeout(deleteDoc(doc(state.db,"salaryAdvances",b.dataset.id)),12000,"ลบรายการเบิกเงิน");invalidateDataCache("salaryAdvances");audit("ลบรายการเบิกเงิน",{user:row?.userName,date:row?.date,amount:row?.amount},row,null).catch(console.warn);afterWrite("delete_advance").catch(console.warn);await loadAdvances({force:true});}catch(err){showToast(friendlyError(err));}
+  });
 }
 
 /* ------------------------------- ค่าตอบแทน ------------------------------- */
@@ -739,6 +972,7 @@ function rememberCurrentCompDraft(){
 }
 function bindCurrentCompCard(){
   const card=$("#compPersonContainer .comp-card"); if(!card)return;
+  bindFriendlyNumberInputs(card);
   card.querySelector(".save-comp")?.addEventListener("click",()=>saveCompCard(card));
   card.querySelector(".comp-pdf")?.addEventListener("click",()=>openCompPdf(card));
   card.querySelector(".manage-paid-daily")?.addEventListener("click",()=>openPaidDailyModal(card.dataset.userId));
@@ -765,14 +999,15 @@ async function renderCompensation(){
   if(!isOwnerOrManager()) return content().innerHTML=`<div class="state error">ไม่มีสิทธิ์</div>`;
   content().innerHTML=`${pageTitle("ค่าตอบแทน","ดูและแก้ไขทีละคน เลื่อนชื่อซ้าย–ขวาได้ พร้อม PDF และแชร์เข้า LINE")}
   <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="compMonth" type="month" value="${currentMonthKey()}"></div><div class="field"><label>&nbsp;</label><button id="loadComp" class="btn secondary">คำนวณใหม่</button></div><div class="field"><label>&nbsp;</label><button id="saveAllComp" class="btn write-action">บันทึกทุกคน</button></div></div></div><div id="compResult"></div>`;
-  $("#loadComp").onclick=()=>loadCompensation().catch(e=>showToast(friendlyError(e))); $("#compMonth").onchange=()=>{state.compSelectedIndex=0;state.compDrafts={};loadCompensation().catch(e=>showToast(friendlyError(e)));}; $("#saveAllComp").onclick=saveAllCompensation; await loadCompensation();
+  const fail=e=>{console.error("compensation",e);if(state.currentPage==="compensation"&&$("#compResult"))$("#compResult").innerHTML=`<div class="state error"><b>โหลดค่าตอบแทนไม่สำเร็จ</b><br>${escapeHtml(friendlyError(e))}</div>`;showToast(friendlyError(e));};
+  $("#loadComp").onclick=()=>loadCompensation().catch(fail); $("#compMonth").onchange=()=>{state.compSelectedIndex=0;state.compDrafts={};loadCompensation().catch(fail);}; $("#saveAllComp").onclick=saveAllCompensation; loadCompensation().catch(fail);
 }
 async function loadCompensation(){
   const month=$("#compMonth")?.value;if(!month)return;const seq=++state.compensationLoadSeq; $("#compResult").innerHTML=`<div class="loading">กำลังคำนวณค่าตอบแทน...</div>`; const data=await calculateCompensationMonth(month); if(seq!==state.compensationLoadSeq||state.currentPage!=="compensation"||!$("#compResult"))return; state.compData=data; state.compDrafts={}; state.compSelectedIndex=Math.min(state.compSelectedIndex||0,Math.max(0,data.rows.length-1));
   const totalNet=data.rows.reduce((s,r)=>s+r.netTransfer,0),totalCost=data.rows.reduce((s,r)=>s+r.totalCost,0);
   const legalWarning=numberValue(data.settings.socialSecurity.maxSalaryBase)<=0?`<div class="state error"><b>ยังไม่ได้กรอกเพดานฐานเงินเดือนสูงสุดสำหรับประกันสังคม</b><br>${isOwner()?"เปิดส่วนตั้งค่าเรทด้านล่าง กรอกเพดานตามกฎหมายของเดือนนี้ แล้วกดบันทึก":"กรุณาให้เจ้าของเป็นผู้ตั้งค่า"}</div>`:"";
   $("#compResult").innerHTML=`${legalWarning}${isOwner()?compSettingsHtml(data.settings):""}${metricCards([{label:"ยอดโอนรวมปลายเดือน",value:`${money(totalNet)} บาท`},{label:"ต้นทุนค่าตอบแทนรวม + ปกส. นายจ้าง",value:`${money(totalCost)} บาท`},{label:"พนักงาน",value:`${data.rows.length} คน`}])}${compPersonNavigatorHtml(data)}`;
-  $("#compSettingsForm")&&($("#compSettingsForm").onsubmit=saveCompSettings); bindCompPersonNavigation(); showCompPerson(state.compSelectedIndex,{remember:false});
+  $("#compSettingsForm")&&($("#compSettingsForm").onsubmit=saveCompSettings); if($("#compSettingsForm"))bindFriendlyNumberInputs($("#compSettingsForm")); bindCompPersonNavigation(); showCompPerson(state.compSelectedIndex,{remember:false});
 }
 function rowFromCard(card){
   const base=state.compData.rows.find(r=>r.userId===card.dataset.userId),salary=base.isDaily?0:numberValue(card.querySelector(".comp-salary")?.value),extraOther=numberValue(card.querySelector(".comp-extra").value),outsideOT=numberValue(card.querySelector(".comp-outside").value),deduction=numberValue(card.querySelector(".comp-deduction").value);
@@ -785,7 +1020,7 @@ async function saveCompSettings(e){
   try{
     const s=mergeCompSettings({otRates:{front_kitchen:numberValue($("#otFrontKitchen").value),back_kitchen:numberValue($("#otBackKitchen").value),front_staff:numberValue($("#otFrontStaff").value),rotating:numberValue($("#otRotating").value)},dailyPay:{fullDay:numberValue($("#dailyFullRate").value),hourly:numberValue($("#dailyHourRate").value)},beerPerBottle:numberValue($("#beerRate").value),dailyBonus:{kitchen:{threshold:numberValue($("#dailyKitchenThreshold").value),amount:numberValue($("#dailyKitchenAmount").value)},front:{threshold:numberValue($("#dailyFrontThreshold").value),amount:numberValue($("#dailyFrontAmount").value)}},monthlyBonus:{kitchen:{threshold:numberValue($("#monthlyKitchenThreshold").value),amount:numberValue($("#monthlyKitchenAmount").value)},front:{threshold:numberValue($("#monthlyFrontThreshold").value),amount:numberValue($("#monthlyFrontAmount").value)}},socialSecurity:{employeeRate:numberValue($("#employeeSSRate").value),employerRate:numberValue($("#employerSSRate").value),maxSalaryBase:numberValue($("#ssMaxBase").value)}});
     if((s.socialSecurity.employeeRate>0||s.socialSecurity.employerRate>0)&&s.socialSecurity.maxSalaryBase<=0)return showToast("กรุณากรอกเพดานฐานเงินเดือนสูงสุดประกันสังคม");
-    const batch=writeBatch(state.db); batch.set(doc(state.db,"compensationMonthSettings",month),{...s,monthKey:month,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:false}); batch.set(doc(state.db,"appSettings","main"),{compensationDefaults:s,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true}); await withTimeout(batch.commit(),18000,"บันทึกเรทค่าตอบแทน"); state.settings.compensationDefaults=s; audit("แก้เรทค่าตอบแทน",{monthKey:month},null,s).catch(console.warn); afterWrite("comp_settings").catch(console.warn); showToast("บันทึกเรทและเพดานประกันสังคมแล้ว"); await loadCompensation();
+    const batch=writeBatch(state.db); batch.set(doc(state.db,"compensationMonthSettings",month),{...s,monthKey:month,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:false}); batch.set(doc(state.db,"appSettings","main"),{compensationDefaults:s,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true}); await withTimeout(batch.commit(),18000,"บันทึกเรทค่าตอบแทน"); invalidateDataCache("compensationMonthSettings"); state.settings.compensationDefaults=s; audit("แก้เรทค่าตอบแทน",{monthKey:month},null,s).catch(console.warn); afterWrite("comp_settings").catch(console.warn); showToast("บันทึกเรทและเพดานประกันสังคมแล้ว"); await loadCompensation();
   }catch(err){console.error("saveCompSettings",err);showToast(friendlyError(err));}
   finally{setButtonBusy(button,false);}
 }
@@ -795,7 +1030,7 @@ async function saveCompRecord(r,{silent=false,button=null}={}){
   try{
     const id=`${r.monthKey}_${r.userId}`,ref=doc(state.db,"compensationRecords",id),before=await getDocResilient(ref,"ตรวจค่าตอบแทนเดิม");
     const data={userId:r.userId,userName:r.userName,role:r.role,monthKey:r.monthKey,isDaily:r.isDaily,salary:r.salary,dailyWageBefore:r.dailyWageBefore,dailyPaid:r.dailyPaid,dailyWage:r.dailyWage,dailyFullDayEarned:r.dailyFullDayEarned||0,dailyHourlyEarned:r.dailyHourlyEarned||0,fullDayCount:r.fullDayCount||0,hourlyDayCount:r.hourlyDayCount||0,hourlyHours:r.hourlyHours||0,paidDailyCount:r.paidDailyCount||0,otHours:r.otHours||0,autoOT:r.autoOT,extraOther:r.extraOther,extraOtherNote:r.extraOtherNote,outsideOT:r.outsideOT,outsideOTNote:r.outsideOTNote,dailyBonus:r.dailyBonus,dailyBonusEligibleDays:r.dailyBonusEligibleDays||0,monthlyBonus:r.monthlyBonus,monthlySalesEligible:r.monthlySalesEligible,beerBonus:r.beerBonus,deduction:r.deduction,deductionNote:r.deductionNote,advances:r.advances,ssBase:r.ssBase||0,employeeSS:r.employeeSS,employerSS:r.employerSS,gross:r.gross,netTransfer:r.netTransfer,totalCost:r.totalCost,bankName:r.bankName,bankAccountNumber:r.bankAccountNumber,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id,updatedByName:state.currentUser.name};
-    const batch=writeBatch(state.db); batch.set(ref,data,{merge:true}); batch.set(doc(state.db,"users",r.userId),{salary:r.salary,bankName:r.bankName,bankAccountNumber:r.bankAccountNumber,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true}); await withTimeout(batch.commit(),18000,"บันทึกค่าตอบแทน");
+    const batch=writeBatch(state.db); batch.set(ref,data,{merge:true}); batch.set(doc(state.db,"users",r.userId),{salary:r.salary,bankName:r.bankName,bankAccountNumber:r.bankAccountNumber,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true}); await withTimeout(batch.commit(),18000,"บันทึกค่าตอบแทน"); invalidateDataCache("compensationRecords");
     const u=state.users.find(u=>u.id===r.userId); if(u){u.salary=r.salary;u.bankName=r.bankName;u.bankAccountNumber=r.bankAccountNumber;}
     state.compDrafts[r.userId]=r; const idx=state.compData?.rows.findIndex(x=>x.userId===r.userId)??-1;if(idx>=0)state.compData.rows[idx]=r;
     audit("บันทึกค่าตอบแทน",{monthKey:r.monthKey,user:r.userName,netTransfer:r.netTransfer},before.exists()?before.data():null,data).catch(console.warn); afterWrite("compensation").catch(console.warn); if(!silent) showToast(`บันทึก ${r.userName} แล้ว`); return data;
@@ -819,7 +1054,7 @@ function openPaidDailyModal(userId){
   const r=state.compData.rows.find(x=>x.userId===userId); if(!r) return; const modal=document.createElement("div"); modal.className="modal-backdrop"; modal.id="paidDailyModal";
   modal.innerHTML=`<div class="modal-card"><div class="modal-head"><div><h3>รายวัน — วันที่ได้รับเงินแล้ว</h3><p>${escapeHtml(r.userName)} · ${thaiMonth(r.monthKey)}</p></div><button class="btn ghost small close-modal">ปิด</button></div><div class="check-list">${r.dailyAttendance.map(a=>{const pay=dailyAttendancePay(a,r.settings);return `<label class="check-item"><input type="checkbox" data-id="${a.id}" ${a.paidDaily?"checked":""}> ${thaiDate(a.date)} · ${attendanceStatusLabel(a.status)} · ${money(pay)} บาท</label>`;}).join("")||`<div class="empty">ไม่มีวันทำงาน</div>`}</div><div class="modal-actions"><button class="btn save-paid-daily write-action">บันทึกสถานะการจ่าย</button></div></div>`;
   document.body.appendChild(modal); modal.querySelector(".close-modal").onclick=()=>modal.remove(); modal.addEventListener("click",e=>{if(e.target===modal)modal.remove();});
-  modal.querySelector(".save-paid-daily").onclick=async()=>{ if(!requireOnline())return; const batch=writeBatch(state.db); modal.querySelectorAll("input[type=checkbox]").forEach(ch=>batch.set(doc(state.db,"attendance",ch.dataset.id),{paidDaily:ch.checked,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true})); await batch.commit(); await audit("แก้สถานะรายวันได้รับเงินแล้ว",{user:r.userName,monthKey:r.monthKey}); await afterWrite("paid_daily"); modal.remove(); showToast("บันทึกแล้ว"); await loadCompensation(); };
+  modal.querySelector(".save-paid-daily").onclick=async()=>{ if(!requireOnline())return; const btn=modal.querySelector(".save-paid-daily");setButtonBusy(btn,true,"กำลังบันทึก...");try{const batch=writeBatch(state.db); modal.querySelectorAll("input[type=checkbox]").forEach(ch=>batch.set(doc(state.db,"attendance",ch.dataset.id),{paidDaily:ch.checked,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true})); await withTimeout(batch.commit(),12000,"บันทึกสถานะการจ่ายรายวัน"); invalidateDataCache("attendance"); audit("แก้สถานะรายวันได้รับเงินแล้ว",{user:r.userName,monthKey:r.monthKey}).catch(console.warn); afterWrite("paid_daily").catch(console.warn); modal.remove(); showToast("บันทึกแล้ว"); loadCompensation().catch(console.warn);}catch(err){showToast(friendlyError(err));}finally{setButtonBusy(btn,false);} };
 }
 function compShareText(r){
   return `Rendo — สรุปค่าตอบแทน ${thaiMonth(r.monthKey)}\n${r.userName} (${ROLE_LABELS[r.role]||r.role})\nธนาคาร: ${r.bankName||"-"}\nเลขบัญชี: ${r.bankAccountNumber||"-"}\nยอดที่ต้องโอนปลายเดือน: ${money(r.netTransfer)} บาท`;
@@ -891,41 +1126,46 @@ async function renderOwnerExpenses(){
   <form id="otherExpenseForm" class="panel expense-entry-top"><h3>เพิ่มรายจ่ายอื่น</h3><div class="grid four"><div class="field"><label>วันที่</label><input id="ownerExpenseDate" type="date" value="${todayISO()}"></div><div class="field"><label>รายการ</label><input id="ownerExpenseName" required placeholder="เช่น ค่าวัตถุดิบ / ซ่อมอุปกรณ์"></div><div class="field"><label>จำนวนเงิน</label><input id="ownerExpenseAmount" type="number" min="0" step="0.01" required></div><div class="field"><label>หมายเหตุ</label><input id="ownerExpenseNote"></div></div><button class="btn write-action">บันทึกรายจ่าย</button></form>
   <section class="panel"><div class="flex"><h3>รายจ่ายประจำ</h3><button id="addRecurring" class="btn secondary small" type="button">+ เพิ่มรายการประจำ</button></div><div id="recurringTemplates"></div></section>
   <section class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="ownerExpenseMonth" type="month" value="${currentMonthKey()}"></div><div class="field"><label>&nbsp;</label><button id="loadOwnerExpenses" class="btn secondary">โหลดเดือน</button></div><div class="field"><label>&nbsp;</label><button id="snapshotRecurring" class="btn write-action">บันทึกรายจ่ายประจำของเดือนนี้</button></div></div></section><div id="ownerExpenseResult"></div>`;
-  $("#otherExpenseForm").onsubmit=saveOwnerExpense; $("#addRecurring").onclick=addRecurringTemplatePrompt; $("#loadOwnerExpenses").onclick=loadOwnerExpenses; $("#ownerExpenseMonth").onchange=loadOwnerExpenses; $("#snapshotRecurring").onclick=snapshotRecurringMonth;
-  await loadRecurringTemplates(); await loadOwnerExpenses();
+  const fail=e=>{console.error("owner expenses",e);if(state.currentPage==="ownerExpenses"&&$("#ownerExpenseResult"))$("#ownerExpenseResult").innerHTML=`<div class="state error">${escapeHtml(friendlyError(e))}</div>`;showToast(friendlyError(e));};
+  $("#otherExpenseForm").onsubmit=saveOwnerExpense; $("#addRecurring").onclick=addRecurringTemplatePrompt; $("#loadOwnerExpenses").onclick=()=>loadOwnerExpenses().catch(fail); $("#ownerExpenseMonth").onchange=()=>loadOwnerExpenses().catch(fail); $("#snapshotRecurring").onclick=snapshotRecurringMonth;
+  bindFriendlyNumberInputs($("#otherExpenseForm"));
+  loadRecurringTemplates().then(()=>loadOwnerExpenses()).catch(fail);
 }
 async function saveOwnerExpense(e){
-  e.preventDefault(); if(!requireOnline())return; const date=$("#ownerExpenseDate").value,name=$("#ownerExpenseName").value.trim(),amount=numberValue($("#ownerExpenseAmount").value),note=$("#ownerExpenseNote").value.trim(); if(!date||!name||amount<=0)return showToast("กรอกวันที่ รายการ และจำนวนเงิน");
-  const d={date,monthKey:monthOf(date),name,amount,note,createdAt:serverTimestamp(),createdAtISO:new Date().toISOString(),createdBy:state.currentUser.id,createdByName:state.currentUser.name}; const ref=await addDoc(collection(state.db,"ownerExpenses"),d); await audit("เพิ่มรายจ่ายเจ้าของลง",{date,name,amount},null,{id:ref.id,...d}); await afterWrite("owner_expense"); $("#ownerExpenseName").value="";$("#ownerExpenseAmount").value="";$("#ownerExpenseNote").value="";showToast("บันทึกรายจ่ายแล้ว"); await loadOwnerExpenses();
+  e.preventDefault(); if(!requireOnline())return; const button=e.submitter||e.currentTarget.querySelector('button[type="submit"]');setButtonBusy(button,true,"กำลังบันทึก...");
+  try{const date=$("#ownerExpenseDate")?.value,name=$("#ownerExpenseName")?.value.trim(),amount=numberValue($("#ownerExpenseAmount")?.value),note=$("#ownerExpenseNote")?.value.trim()||""; if(!date||!name||amount<=0)return showToast("กรอกวันที่ รายการ และจำนวนเงิน");
+  const d={date,monthKey:monthOf(date),name,amount,note,createdAt:serverTimestamp(),createdAtISO:new Date().toISOString(),createdBy:state.currentUser.id,createdByName:state.currentUser.name}; const ref=await withTimeout(addDoc(collection(state.db,"ownerExpenses"),d),12000,"บันทึกรายจ่าย"); invalidateDataCache("ownerExpenses"); audit("เพิ่มรายจ่ายเจ้าของลง",{date,name,amount},null,{id:ref.id,...d}).catch(console.warn); afterWrite("owner_expense").catch(console.warn); $("#ownerExpenseName").value="";$("#ownerExpenseAmount").value="0";$("#ownerExpenseNote").value="";showToast("บันทึกรายจ่ายแล้ว");loadOwnerExpenses({force:true}).catch(console.warn);}catch(err){showToast(friendlyError(err));}finally{setButtonBusy(button,false);}
 }
+
 async function loadRecurringTemplates(){
-  const rows=(await allDocs("recurringExpenseTemplates")).filter(x=>x.active!==false).sort((a,b)=>numberValue(a.order)-numberValue(b.order)||String(a.name).localeCompare(String(b.name),"th")); state.recurringTemplates=rows;
+  const requestId=state.navRequestId,rows=(await allDocs("recurringExpenseTemplates")).filter(x=>x.active!==false).sort((a,b)=>numberValue(a.order)-numberValue(b.order)||String(a.name).localeCompare(String(b.name),"th")); if(!pageStillActive("ownerExpenses",requestId)||!$("#recurringTemplates"))return; state.recurringTemplates=rows;
   $("#recurringTemplates").innerHTML=rows.length?`<div class="table-wrap"><table class="mobile-card-table"><thead><tr><th>ลำดับ</th><th>รายการ</th><th class="money">จำนวนเงิน</th><th>จัดการ</th></tr></thead><tbody>${rows.map((r,i)=>`<tr><td data-label="ลำดับ">${i+1}</td><td data-label="รายการ"><input class="rec-name" data-id="${r.id}" value="${escapeHtml(r.name)}"></td><td data-label="จำนวนเงิน"><input class="rec-amount" data-id="${r.id}" type="number" min="0" step="0.01" value="${numberValue(r.amount)}"></td><td data-label="จัดการ"><div class="row-actions"><button class="btn secondary small rec-up" data-id="${r.id}" ${i===0?"disabled":""}>↑</button><button class="btn secondary small rec-down" data-id="${r.id}" ${i===rows.length-1?"disabled":""}>↓</button><button class="btn small save-rec write-action" data-id="${r.id}">บันทึก</button><button class="btn danger small delete-rec write-action" data-id="${r.id}">ลบ</button></div></td></tr>`).join("")}</tbody></table></div>`:`<div class="empty">ยังไม่มีรายจ่ายประจำ</div>`;
-  $$(".save-rec").forEach(b=>b.onclick=()=>saveRecurringTemplate(b.dataset.id)); $$(".delete-rec").forEach(b=>b.onclick=()=>deleteRecurringTemplate(b.dataset.id)); $$(".rec-up").forEach(b=>b.onclick=()=>moveRecurring(b.dataset.id,-1)); $$(".rec-down").forEach(b=>b.onclick=()=>moveRecurring(b.dataset.id,1));
+  bindFriendlyNumberInputs($("#recurringTemplates")); $$(".save-rec").forEach(b=>b.onclick=()=>saveRecurringTemplate(b.dataset.id)); $$(".delete-rec").forEach(b=>b.onclick=()=>deleteRecurringTemplate(b.dataset.id)); $$(".rec-up").forEach(b=>b.onclick=()=>moveRecurring(b.dataset.id,-1)); $$(".rec-down").forEach(b=>b.onclick=()=>moveRecurring(b.dataset.id,1));
 }
-async function addRecurringTemplatePrompt(){ if(!requireOnline())return; const name=prompt("ชื่อรายจ่ายประจำ"); if(!name?.trim())return; const amount=numberValue(prompt("จำนวนเงินต่อเดือน","0")); const order=(state.recurringTemplates?.length||0)+1; const d={name:name.trim(),amount,order,active:true,createdAt:serverTimestamp(),updatedAt:serverTimestamp(),updatedBy:state.currentUser.id}; const ref=await addDoc(collection(state.db,"recurringExpenseTemplates"),d); await audit("เพิ่มรายจ่ายประจำ",{name:d.name,amount},null,{id:ref.id,...d}); await afterWrite("recurring_expense"); await loadRecurringTemplates(); }
-async function saveRecurringTemplate(id){ if(!requireOnline())return; const name=$(`.rec-name[data-id="${id}"]`).value.trim(),amount=numberValue($(`.rec-amount[data-id="${id}"]`).value),before=state.recurringTemplates.find(x=>x.id===id); if(!name)return showToast("กรอกชื่อรายการ"); const after={name,amount,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id}; await updateDoc(doc(state.db,"recurringExpenseTemplates",id),after); await audit("แก้รายจ่ายประจำ",{name,amount},before,{...before,...after}); await afterWrite("recurring_expense");showToast("บันทึกแล้ว");await loadRecurringTemplates(); }
-async function deleteRecurringTemplate(id){ if(!requireOnline()||!confirm("ยืนยันลบรายการประจำนี้"))return; const before=state.recurringTemplates.find(x=>x.id===id); await updateDoc(doc(state.db,"recurringExpenseTemplates",id),{active:false,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id}); await audit("ลบรายจ่ายประจำ",{name:before?.name},before,null); await afterWrite("recurring_expense");await loadRecurringTemplates(); }
-async function moveRecurring(id,delta){ if(!requireOnline())return; const rows=state.recurringTemplates.slice(),i=rows.findIndex(x=>x.id===id),j=i+delta;if(i<0||j<0||j>=rows.length)return;[rows[i],rows[j]]=[rows[j],rows[i]];const batch=writeBatch(state.db);rows.forEach((r,k)=>batch.set(doc(state.db,"recurringExpenseTemplates",r.id),{order:k+1,updatedAt:serverTimestamp()},{merge:true}));await batch.commit();await audit("เรียงรายจ่ายประจำ",{item:userName(id)});await loadRecurringTemplates(); }
+async function addRecurringTemplatePrompt(){ if(!requireOnline())return; const name=prompt("ชื่อรายจ่ายประจำ"); if(!name?.trim())return; const amount=numberValue(prompt("จำนวนเงินต่อเดือน","0")); const order=(state.recurringTemplates?.length||0)+1; const d={name:name.trim(),amount,order,active:true,createdAt:serverTimestamp(),updatedAt:serverTimestamp(),updatedBy:state.currentUser.id}; const ref=await addDoc(collection(state.db,"recurringExpenseTemplates"),d); invalidateDataCache("recurringExpenseTemplates"); await audit("เพิ่มรายจ่ายประจำ",{name:d.name,amount},null,{id:ref.id,...d}); await afterWrite("recurring_expense"); await loadRecurringTemplates(); }
+async function saveRecurringTemplate(id){ if(!requireOnline())return; const name=$(`.rec-name[data-id="${id}"]`).value.trim(),amount=numberValue($(`.rec-amount[data-id="${id}"]`).value),before=state.recurringTemplates.find(x=>x.id===id); if(!name)return showToast("กรอกชื่อรายการ"); const after={name,amount,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id}; await updateDoc(doc(state.db,"recurringExpenseTemplates",id),after); invalidateDataCache("recurringExpenseTemplates"); await audit("แก้รายจ่ายประจำ",{name,amount},before,{...before,...after}); await afterWrite("recurring_expense");showToast("บันทึกแล้ว");await loadRecurringTemplates(); }
+async function deleteRecurringTemplate(id){ if(!requireOnline()||!confirm("ยืนยันลบรายการประจำนี้"))return; const before=state.recurringTemplates.find(x=>x.id===id); await updateDoc(doc(state.db,"recurringExpenseTemplates",id),{active:false,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id}); invalidateDataCache("recurringExpenseTemplates"); await audit("ลบรายจ่ายประจำ",{name:before?.name},before,null); await afterWrite("recurring_expense");await loadRecurringTemplates(); }
+async function moveRecurring(id,delta){ if(!requireOnline())return; const rows=state.recurringTemplates.slice(),i=rows.findIndex(x=>x.id===id),j=i+delta;if(i<0||j<0||j>=rows.length)return;[rows[i],rows[j]]=[rows[j],rows[i]];const batch=writeBatch(state.db);rows.forEach((r,k)=>batch.set(doc(state.db,"recurringExpenseTemplates",r.id),{order:k+1,updatedAt:serverTimestamp()},{merge:true}));await batch.commit();invalidateDataCache("recurringExpenseTemplates");await audit("เรียงรายจ่ายประจำ",{item:userName(id)});await loadRecurringTemplates(); }
 async function snapshotRecurringMonth(){
   if(!requireOnline())return; const month=$("#ownerExpenseMonth").value,templates=(state.recurringTemplates||[]); if(!confirm(`บันทึกรายจ่ายประจำ ${templates.length} รายการสำหรับ ${thaiMonth(month)} หรือไม่`))return;
-  const old=await docsByMonth("recurringExpenseMonths",month),batch=writeBatch(state.db); old.forEach(x=>batch.delete(doc(state.db,"recurringExpenseMonths",x.id))); templates.forEach((t,i)=>batch.set(doc(state.db,"recurringExpenseMonths",`${month}_${t.id}`),{monthKey:month,templateId:t.id,name:t.name,amount:numberValue(t.amount),order:i+1,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id})); await batch.commit(); await audit("บันทึกรายจ่ายประจำของเดือน",{monthKey:month,count:templates.length}); await afterWrite("recurring_month");showToast("บันทึกรายจ่ายประจำของเดือนแล้ว");await loadOwnerExpenses();
+  const old=await docsByMonth("recurringExpenseMonths",month),batch=writeBatch(state.db); old.forEach(x=>batch.delete(doc(state.db,"recurringExpenseMonths",x.id))); templates.forEach((t,i)=>batch.set(doc(state.db,"recurringExpenseMonths",`${month}_${t.id}`),{monthKey:month,templateId:t.id,name:t.name,amount:numberValue(t.amount),order:i+1,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id})); await batch.commit(); invalidateDataCache("recurringExpenseMonths"); await audit("บันทึกรายจ่ายประจำของเดือน",{monthKey:month,count:templates.length}); await afterWrite("recurring_month");showToast("บันทึกรายจ่ายประจำของเดือนแล้ว");await loadOwnerExpenses();
 }
-async function loadOwnerExpenses(){
-  const month=$("#ownerExpenseMonth").value; $("#ownerExpenseResult").innerHTML=`<div class="loading">กำลังคำนวณ...</div>`;
-  const [other,monthlyRec,comp]=await Promise.all([docsByMonth("ownerExpenses",month),docsByMonth("recurringExpenseMonths",month),calculateCompensationMonth(month)]); const rec=monthlyRec.length?monthlyRec:(state.recurringTemplates||[]); const compRows=comp.rows;
+async function loadOwnerExpenses({force=false}={}){
+  const result=$("#ownerExpenseResult"),month=$("#ownerExpenseMonth")?.value;if(!result||!month)return;const seq=++state.ownerExpensesLoadSeq,requestId=state.navRequestId; result.innerHTML=`<div class="loading">กำลังคำนวณ...</div>`;
+  const [other,monthlyRec,comp]=await Promise.all([docsByMonth("ownerExpenses",month,{force}),docsByMonth("recurringExpenseMonths",month,{force}),calculateCompensationMonth(month)]); if(seq!==state.ownerExpensesLoadSeq||!pageStillActive("ownerExpenses",requestId)||!$("#ownerExpenseResult"))return; const rec=monthlyRec.length?monthlyRec:(state.recurringTemplates||[]); const compRows=comp.rows;
   const otherTotal=other.reduce((s,x)=>s+numberValue(x.amount),0),recTotal=rec.reduce((s,x)=>s+numberValue(x.amount),0),compTotal=compRows.reduce((s,x)=>s+numberValue(x.totalCost),0),grand=otherTotal+recTotal+compTotal;
   $("#ownerExpenseResult").innerHTML=`${metricCards([{label:"ค่าตอบแทนพนักงาน (ต้นทุนรวม + ปกส.)",value:`${money(compTotal)} บาท`},{label:"รายจ่ายประจำ",value:`${money(recTotal)} บาท`,sub:monthlyRec.length?"บันทึกเป็นของเดือนนี้แล้ว":"ตัวอย่างจากรายการประจำล่าสุด"},{label:"รายจ่ายอื่น",value:`${money(otherTotal)} บาท`},{label:"รายจ่ายเจ้าของลงรวม",value:`${money(grand)} บาท`}])}
   <div class="grid two"><section class="panel"><h3>ค่าตอบแทนพนักงาน</h3>${compRows.length?`<div class="table-wrap"><table><thead><tr><th>พนักงาน</th><th class="money">ต้นทุนรวม + ปกส.</th></tr></thead><tbody>${compRows.map(r=>`<tr><td>${escapeHtml(r.userName)}</td><td class="money">${money(r.totalCost)}</td></tr>`).join("")}</tbody></table></div>`:`<div class="empty">ไม่มีข้อมูล</div>`}</section>
   <section class="panel"><h3>รายจ่ายประจำของเดือน</h3>${rec.length?`<div class="table-wrap"><table><thead><tr><th>รายการ</th><th class="money">จำนวน</th></tr></thead><tbody>${rec.sort((a,b)=>numberValue(a.order)-numberValue(b.order)).map(r=>`<tr><td>${escapeHtml(r.name)}</td><td class="money">${money(r.amount)}</td></tr>`).join("")}</tbody></table></div>`:`<div class="empty">ไม่มีข้อมูล</div>`}</section></div>
   <section class="panel"><h3>รายจ่ายอื่น ${thaiMonth(month)}</h3>${other.length?`<div class="table-wrap"><table class="mobile-card-table"><thead><tr><th>วันที่</th><th>รายการ</th><th class="money">จำนวน</th><th>หมายเหตุ</th><th></th></tr></thead><tbody>${other.sort((a,b)=>String(b.date).localeCompare(String(a.date))).map(r=>`<tr><td data-label="วันที่">${thaiDate(r.date)}</td><td data-label="รายการ">${escapeHtml(r.name)}</td><td data-label="จำนวน" class="money">${money(r.amount)}</td><td data-label="หมายเหตุ">${escapeHtml(r.note||"")}</td><td data-label="จัดการ"><button class="btn danger small delete-owner-expense" data-id="${r.id}">ลบ</button></td></tr>`).join("")}</tbody></table></div>`:`<div class="empty">ยังไม่มีรายจ่ายอื่น</div>`}</section>`;
-  $$(".delete-owner-expense").forEach(b=>b.onclick=async()=>{if(!requireOnline()||!confirm("ยืนยันลบรายจ่ายนี้"))return;const row=other.find(x=>x.id===b.dataset.id);await deleteDoc(doc(state.db,"ownerExpenses",b.dataset.id));await audit("ลบรายจ่ายเจ้าของลง",{name:row?.name,date:row?.date,amount:row?.amount},row,null);await afterWrite("owner_expense");await loadOwnerExpenses();});
+  $$(".delete-owner-expense").forEach(b=>b.onclick=async()=>{if(!requireOnline()||!confirm("ยืนยันลบรายจ่ายนี้"))return;const row=other.find(x=>x.id===b.dataset.id);await deleteDoc(doc(state.db,"ownerExpenses",b.dataset.id));invalidateDataCache("ownerExpenses");await audit("ลบรายจ่ายเจ้าของลง",{name:row?.name,date:row?.date,amount:row?.amount},row,null);await afterWrite("owner_expense");await loadOwnerExpenses();});
 }
 
 /* -------------------------------- ประวัติ -------------------------------- */
 function auditDetailText(r){ const d=r.details||{},parts=[]; if(d.user)parts.push(`ผู้เกี่ยวข้อง: ${d.user}`);if(d.date)parts.push(`วันที่: ${thaiDate(d.date)}`);if(d.monthKey)parts.push(`เดือน: ${thaiMonth(d.monthKey)}`);if(d.status)parts.push(`สถานะ: ${d.status}`);if(d.amount!==undefined)parts.push(`จำนวน: ${money(d.amount)} บาท`);if(d.name)parts.push(`รายการ: ${d.name}`);if(d.role)parts.push(`ระดับ: ${ROLE_LABELS[d.role]||d.role}`);if(d.selectedUser)parts.push(`เลือกชื่อ: ${d.selectedUser}`);if(d.netTransfer!==undefined)parts.push(`ยอดโอน: ${money(d.netTransfer)} บาท`);return parts.join(" · ")||"-"; }
 async function renderHistory(category){
   if(category==="system"&&!isOwner())return content().innerHTML=`<div class="state error">เฉพาะเจ้าของ</div>`; if(category==="activity"&&!isOwnerOrManager())return content().innerHTML=`<div class="state error">ไม่มีสิทธิ์</div>`;
+  const page=category==="system"?"systemHistory":"history",seq=++state.historyLoadSeq,requestId=state.navRequestId;
   content().innerHTML=`${pageTitle(category==="system"?"ประวัติระบบ":"ประวัติการทำรายการ",category==="system"?"Login สร้าง/แก้ไข/ลบผู้ใช้ และการเปลี่ยน PIN":"รายการสำคัญ เช่น ยอดขาย วันทำงาน เบิกเงิน ค่าตอบแทน และรายจ่าย")}<div id="historyResult" class="panel"><div class="loading">กำลังโหลด...</div></div>`;
   let rows;
   if(isOwner()) rows=(await allDocs("auditLogs")).filter(r=>r.category===category);
@@ -933,9 +1173,10 @@ async function renderHistory(category){
     const snap=await getDocsResilient(query(collection(state.db,"auditLogs"),where("category","==","activity"),where("hidden","==",false)),"โหลดประวัติ");
     rows=snap.docs.map(d=>({id:d.id,...d.data()}));
   }
+  if(seq!==state.historyLoadSeq||!pageStillActive(page,requestId)||!$("#historyResult"))return;
   rows=rows.sort((a,b)=>String(b.createdAtISO||"").localeCompare(String(a.createdAtISO||""))).slice(0,400);
   $("#historyResult").innerHTML=rows.length?`<div class="table-wrap"><table class="mobile-card-table"><thead><tr><th>วันเวลา</th><th>ผู้ทำ</th><th>รายการ</th><th>รายละเอียด</th>${isOwner()?"<th>ซ่อน/แสดง</th>":""}</tr></thead><tbody>${rows.map(r=>`<tr class="${r.hidden?"hidden-log":""}"><td data-label="วันเวลา">${formatTs(r.createdAt||r.createdAtISO)}</td><td data-label="ผู้ทำ">${escapeHtml(r.actorName)} · ${escapeHtml(ROLE_LABELS[r.role]||r.role||"")}</td><td data-label="รายการ"><b>${escapeHtml(r.action)}</b></td><td data-label="รายละเอียด">${escapeHtml(auditDetailText(r))}</td>${isOwner()?`<td data-label="ซ่อน/แสดง"><button class="btn ${r.hidden?"secondary":"ghost"} small toggle-history" data-id="${r.id}" data-hidden="${r.hidden?"1":"0"}">${r.hidden?"แสดงกลับ":"ซ่อน"}</button></td>`:""}</tr>`).join("")}</tbody></table></div>`:`<div class="empty">ยังไม่มีประวัติ</div>`;
-  $$(".toggle-history").forEach(b=>b.onclick=async()=>{if(!requireOnline())return;const hidden=b.dataset.hidden!=="1";await updateDoc(doc(state.db,"auditLogs",b.dataset.id),{hidden,hiddenAt:serverTimestamp(),hiddenBy:state.currentUser.id});showToast(hidden?"ซ่อนแล้ว — เจ้าของยังเห็นเป็นตัวจาง":"แสดงกลับแล้ว");await renderHistory(category);});
+  $$(".toggle-history").forEach(b=>b.onclick=async()=>{if(!requireOnline())return;const hidden=b.dataset.hidden!=="1";await updateDoc(doc(state.db,"auditLogs",b.dataset.id),{hidden,hiddenAt:serverTimestamp(),hiddenBy:state.currentUser.id});invalidateDataCache("auditLogs");showToast(hidden?"ซ่อนแล้ว — เจ้าของยังเห็นเป็นตัวจาง":"แสดงกลับแล้ว");await renderHistory(category);});
 }
 
 /* ------------------------------- สำรองข้อมูล ------------------------------- */

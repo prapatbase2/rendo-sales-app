@@ -1,5 +1,5 @@
-/* Rendo Backup Web App v1.1.0 — บันทึก JSON ลง Google Drive */
-const BACKUP_APP_VERSION = 'Rendo Backup v1.1.0';
+/* Rendo Backup Web App v1.2.0 — บันทึก JSON ลง Google Drive */
+const BACKUP_APP_VERSION = 'Rendo Backup v1.2.0';
 const BACKUP_FOLDER_NAME = 'Rendo_Backups';
 const BACKUP_FOLDER_ID = ''; // ใส่ Folder ID ได้ หรือปล่อยว่างให้ระบบสร้าง/ค้นหาโฟลเดอร์
 

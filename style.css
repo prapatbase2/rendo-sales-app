@@ -501,7 +501,7 @@ body.is-offline #pageContent textarea{
   .pdf-one-page .pdf-info-grid{grid-template-columns:1fr}
 }
 
-/* Rendo v1.1.0 — โทนดำ/ทองและส่วนประกอบเฉพาะระบบ */
+/* Rendo v1.2.0 — โทนดำ/ทองและส่วนประกอบเฉพาะระบบ */
 .login-subtitle{margin:0 0 4px;color:var(--muted);font-weight:700;letter-spacing:.04em}
 .login-card{background:linear-gradient(180deg,#fff,#fffaf2)}
 .login-logo{background:#050505;border-color:#2b2113;padding:0}
@@ -556,7 +556,7 @@ code{background:#17110a;color:#f1c77e;padding:4px 7px;border-radius:8px;font-wei
   .brand img{width:44px;height:44px}
 }
 
-/* Rendo v1.1.0 — ความเสถียร หน้าค่าตอบแทนทีละคน และ PDF */
+/* Rendo v1.2.0 — ความเสถียร หน้าค่าตอบแทนทีละคน และ PDF */
 .loading::before{content:"";display:inline-block;width:18px;height:18px;margin-right:9px;vertical-align:-4px;border:3px solid var(--line);border-top-color:var(--primary);border-radius:50%;animation:rendoSpin .8s linear infinite}
 @keyframes rendoSpin{to{transform:rotate(360deg)}}
 .is-busy{opacity:.72;pointer-events:none}
@@ -611,4 +611,18 @@ code{background:#17110a;color:#f1c77e;padding:4px 7px;border-radius:8px;font-wei
   .comp-person-tab{min-width:132px}
   .comp-settings-form{padding:10px}
   .pdf-sheet{padding:5px}
+}
+
+/* v1.2.0: ความลื่นไหล การโหลดวันทำงาน และช่องตัวเลข */
+.att-record-state{margin:-3px 0 12px;padding:9px 11px;border-radius:12px;font-size:.9rem;font-weight:800}
+.att-record-state.loading-inline{background:#f5f3ed;color:var(--muted);border:1px solid var(--line)}
+.att-record-state.ok-inline{background:#eef8e9;color:#2d6a25;border:1px solid #cfe7c7}
+.att-record-state.warn-inline{background:#fff8df;color:#795200;border:1px solid #efd894}
+.att-record-state.error-inline{background:#fff0ef;color:#9b2f2a;border:1px solid #efc6c2}
+input[type="number"]:not([readonly]):focus{outline:3px solid color-mix(in srgb,var(--primary) 24%,transparent);outline-offset:1px}
+.nav-item{touch-action:manipulation}
+#saleState{max-width:100%;white-space:normal;text-align:center}
+@media(max-width:680px){
+  .att-record-state{font-size:.86rem}
+  .important-field small{display:block;line-height:1.45}
 }
