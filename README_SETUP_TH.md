@@ -1,0 +1,445 @@
+# Rendo PWA v1.0 — คู่มือติดตั้งสำหรับผู้เริ่มต้น
+
+ระบบนี้เป็น Progressive Web App สำหรับร้าน **Rendo — Ramen & Gyoza** ใช้งานบนมือถือและคอมพิวเตอร์ ติดตั้งเป็นไอคอนเหมือนแอปได้ และรองรับทีมขนาดเล็กประมาณ 10 คน
+
+## ไฟล์สำคัญ
+
+- `index.html` หน้าเริ่มต้นและ Firebase config ของโครงการ `rendo-sales`
+- `app.js` ระบบทั้งหมด
+- `style.css` รูปแบบหน้าจอมือถือ/คอมพิวเตอร์
+- `manifest.webmanifest` ข้อมูลสำหรับติดตั้ง PWA
+- `sw.js` Service Worker สำหรับเปิดหน้าและดูข้อมูลแคชขณะออฟไลน์
+- `firebase-rules.txt` กฎสิทธิ์ Firestore ที่ต้องนำไปวางใน Firebase Console
+- `apps-script-backup.gs` โค้ดสำรอง JSON ไป Google Drive
+- `firebase.json` และ `.firebaserc` สำหรับ Firebase Hosting
+- `เปิดทดสอบในเครื่อง.bat` เปิดทดสอบบน Windows
+
+---
+
+# ส่วนที่ 1: ตั้งค่า Firebase
+
+## 1. เข้าโครงการ Firebase
+
+1. เปิด <https://console.firebase.google.com/>
+2. เข้าโครงการชื่อ `rendo-sales`
+3. ตรวจว่า Project ID คือ `rendo-sales`
+
+Firebase config ถูกใส่ไว้ใน `index.html` แล้วดังนี้:
+
+```js
+{
+  apiKey: "AIzaSyB0yv0m7brx8WXyw8zTK8tqVm4K9I1EmzM",
+  authDomain: "rendo-sales.firebaseapp.com",
+  projectId: "rendo-sales",
+  storageBucket: "rendo-sales.firebasestorage.app",
+  messagingSenderId: "1088583610974",
+  appId: "1:1088583610974:web:e1aa7525fd2c4dc58a7acf"
+}
+```
+
+ค่า Firebase Web API Key เป็นค่าที่ใช้ในเว็บตามปกติ การป้องกันข้อมูลจริงอยู่ที่ Firebase Authentication และ Firestore Rules
+
+## 2. เปิด Authentication แบบ Email/Password
+
+ระบบแสดงให้พนักงาน Login ด้วยชื่อและ PIN 4 ตัว แต่ภายในใช้ Firebase Email/Password เพื่อให้ Firestore แยกตัวตนและบังคับสิทธิ์ได้จริง
+
+1. Firebase Console → **Build** → **Authentication**
+2. กด **Get started**
+3. แท็บ **Sign-in method**
+4. เลือก **Email/Password**
+5. เปิดสวิตช์ **Email/Password**
+6. กด **Save**
+
+ไม่จำเป็นต้องเปิด Anonymous Authentication
+
+## 3. สร้าง Cloud Firestore
+
+1. Firebase Console → **Build** → **Firestore Database**
+2. กด **Create database**
+3. เลือก Region ใกล้ผู้ใช้ เช่นเอเชีย
+4. เลือก Production mode ได้
+5. รอจนฐานข้อมูลสร้างเสร็จ
+
+## 4. ใส่ Firestore Rules
+
+1. Firestore Database → แท็บ **Rules**
+2. เปิดไฟล์ `firebase-rules.txt`
+3. คัดลอกทั้งหมดไปแทนกฎเดิม
+4. กด **Publish**
+
+กฎที่แนบมาแยกสิทธิ์ตามบทบาท เช่น:
+
+- รายชื่อหน้า Login อ่านได้โดยไม่มี PIN
+- PIN อยู่ใน `pinVault` และอ่านได้เฉพาะเจ้าของ
+- พนักงานลงวันทำงานได้เฉพาะตัวเอง
+- ยอดขายเขียนได้เฉพาะเจ้าของ ผู้จัดการ หัวหน้า และพนักงานหน้าร้าน
+- ค่าตอบแทนอ่าน/เขียนได้เฉพาะเจ้าของและผู้จัดการ
+- การตั้งค่าและ Restore ทำได้เฉพาะเจ้าของ
+
+ห้ามเปลี่ยนเป็น `allow read, write: if true;` เพราะจะทำให้ข้อมูลเป็นสาธารณะ
+
+## 5. สร้าง Composite Indexes
+
+เพื่อให้หน้าประวัติของผู้จัดการและหน้ารายการเบิกเงินของพนักงานค้นหาแบบจำกัดสิทธิ์ได้รวดเร็ว ให้สร้าง Index ตามไฟล์ `firestore.indexes.json`
+
+วิธีผ่าน Firebase Console:
+
+1. Firestore Database → **Indexes** → **Composite** → **Create index**
+2. สร้าง Collection ID `salaryAdvances` โดยเพิ่มฟิลด์ `monthKey` แบบ Ascending และ `userId` แบบ Ascending; Query scope เลือก Collection
+3. สร้าง Collection ID `auditLogs` โดยเพิ่มฟิลด์ `category` แบบ Ascending และ `hidden` แบบ Ascending; Query scope เลือก Collection
+4. รอ Status เปลี่ยนเป็น **Enabled**
+
+หรือใช้ Firebase CLI ในโฟลเดอร์แอป:
+
+```bash
+firebase deploy --only firestore:indexes
+```
+
+---
+
+# ส่วนที่ 2: ทดสอบในเครื่อง Windows
+
+ห้ามเปิด `index.html` ด้วยการดับเบิลคลิก เพราะ PWA และ JavaScript Module ต้องเปิดผ่าน Web Server
+
+1. แตก ZIP ทั้งโฟลเดอร์
+2. ดับเบิลคลิก `เปิดทดสอบในเครื่อง.bat`
+3. Browser จะเปิด `http://localhost:8000`
+4. ถ้า Windows ถาม Firewall ให้เลือกอนุญาตเฉพาะ Private network
+5. ห้ามปิดหน้าต่าง Command Prompt ระหว่างทดสอบ
+
+กรณีคำสั่ง `py` ใช้ไม่ได้ ให้ติดตั้ง Python จาก Microsoft Store หรือเปิด Command Prompt ในโฟลเดอร์แล้วใช้:
+
+```bash
+python -m http.server 8000
+```
+
+---
+
+# ส่วนที่ 3: สร้างเจ้าของคนแรก
+
+เมื่อเปิดระบบครั้งแรกและยังไม่มีผู้ใช้:
+
+1. กรอกชื่อเจ้าของ
+2. กรอก PIN ตัวเลข 4 ตัว
+3. กด **สร้างระบบ Rendo**
+4. ระบบสร้างบัญชี Firebase Authentication, โปรไฟล์เจ้าของ, PIN Vault และค่าเริ่มต้น
+5. Login อีกครั้งด้วยชื่อเจ้าของและ PIN
+
+คำแนะนำ:
+
+- อย่าใช้ PIN เช่น `0000`, `1111`, `1234` หรือปีเกิด
+- ไม่ควรติ๊กจดจำ PIN บนอุปกรณ์สาธารณะ
+- เจ้าของดู PIN ของทุกคนได้จากหน้า **ผู้ใช้**
+
+---
+
+# ส่วนที่ 4: นำขึ้น GitHub Pages
+
+GitHub Pages เหมาะกับไฟล์เว็บ static และใช้งานง่าย แต่ Repository แบบ Public จะทำให้ไฟล์โค้ดถูกเปิดดูได้ ซึ่งไม่ใช่ปัญหาสำหรับ Firebase config หาก Firestore Rules ถูกต้องตามไฟล์ที่ให้ไว้
+
+## วิธีอัปโหลดผ่านหน้าเว็บ
+
+1. สมัคร/เข้า <https://github.com/>
+2. กด **New repository**
+3. ตั้งชื่อ เช่น `rendo-pwa`
+4. เลือก Public หากบัญชีของคุณไม่มี GitHub Pages สำหรับ Private repository
+5. กด **Create repository**
+6. กด **uploading an existing file**
+7. ลากไฟล์และโฟลเดอร์ทั้งหมดใน `rendo_pwa_v1_0` ลงไป รวมถึงโฟลเดอร์ `icons`
+8. กด **Commit changes**
+9. ไปที่ **Settings** → **Pages**
+10. Source เลือก **Deploy from a branch**
+11. Branch เลือก `main` และโฟลเดอร์ `/ (root)`
+12. กด **Save**
+13. รอ 1–5 นาที แล้วเปิด URL ที่ GitHub แสดง เช่น `https://ชื่อผู้ใช้.github.io/rendo-pwa/`
+
+## เพิ่มโดเมนใน Firebase Authentication
+
+ถ้า Login ขึ้น `auth/unauthorized-domain`:
+
+1. Firebase Console → Authentication → Settings
+2. **Authorized domains**
+3. เพิ่ม `ชื่อผู้ใช้.github.io`
+4. Save แล้วลองใหม่
+
+---
+
+# ส่วนที่ 5: ใช้ Firebase Hosting แทน GitHub Pages
+
+Firebase Hosting ให้ HTTPS และทำงานร่วมกับ Firebase ได้โดยตรง
+
+## ติดตั้งเครื่องมือ
+
+1. ติดตั้ง Node.js LTS จาก <https://nodejs.org/>
+2. เปิด Command Prompt
+3. รัน:
+
+```bash
+npm install -g firebase-tools
+firebase login
+```
+
+## Deploy
+
+เปิด Command Prompt ในโฟลเดอร์แอป แล้วรัน:
+
+```bash
+firebase use rendo-sales
+firebase deploy --only hosting
+```
+
+เมื่อเสร็จจะได้ URL ประมาณ:
+
+```text
+https://rendo-sales.web.app
+```
+
+หากต้องการ Deploy Rules และ Indexes ด้วย:
+
+```bash
+firebase deploy --only firestore:rules,firestore:indexes
+```
+
+ไฟล์ `firebase.json` ที่แนบมาอ้างถึง `firebase-rules.txt` และ `firestore.indexes.json` ไว้แล้ว
+
+---
+
+# ส่วนที่ 6: ติดตั้งเป็น PWA บนมือถือ
+
+## Android / Chrome
+
+1. เปิด URL ของแอปด้วย Chrome
+2. กดเมนู ⋮
+3. เลือก **ติดตั้งแอป** หรือ **เพิ่มไปยังหน้าจอหลัก**
+4. กดยืนยัน
+
+## iPhone / iPad / Safari
+
+1. เปิด URL ด้วย Safari
+2. กดปุ่ม Share
+3. เลือก **Add to Home Screen / เพิ่มไปยังหน้าจอโฮม**
+4. กด Add
+
+หลังเปิดออนไลน์ครั้งแรก ระบบจะเก็บไฟล์หน้าแอปไว้ ออฟไลน์สามารถเปิดและดูข้อมูลที่เคยแคชได้ แต่ปุ่มแก้ไข บันทึก ลบ และ Restore จะถูกปิด พร้อมแจ้งให้ต่ออินเทอร์เน็ตก่อน
+
+การ Login ออฟไลน์ทำได้เฉพาะบัญชีที่เคย Login สำเร็จบนเครื่องนั้นและยังมี Firebase session อยู่
+
+---
+
+# ส่วนที่ 7: สำรองข้อมูลไป Google Drive
+
+## 1. สร้าง Google Apps Script
+
+1. เปิด <https://script.google.com/>
+2. กด **New project**
+3. ลบโค้ดเดิมใน `Code.gs`
+4. เปิดไฟล์ `apps-script-backup.gs`
+5. คัดลอกทั้งหมดไปวาง
+6. ตั้งชื่อโปรเจกต์ เช่น `Rendo Backup`
+7. กด Save
+
+ค่าเริ่มต้นจะสร้างหรือใช้โฟลเดอร์ชื่อ `Rendo_Backups` ใน Google Drive
+
+หากต้องการบังคับใช้โฟลเดอร์เฉพาะ:
+
+1. เปิดโฟลเดอร์ใน Google Drive
+2. URL จะมี `/folders/รหัสโฟลเดอร์`
+3. นำรหัสไปใส่ใน:
+
+```js
+const BACKUP_FOLDER_ID = 'ใส่รหัสที่นี่';
+```
+
+## 2. Deploy เป็น Web App
+
+1. Google Apps Script → **Deploy** → **New deployment**
+2. Type เลือก **Web app**
+3. Execute as เลือก **Me**
+4. Who has access เลือก **Anyone**
+5. กด **Deploy**
+6. ยอมรับ Permission ที่ Google ขอ
+7. คัดลอก Web App URL ซึ่งลงท้ายด้วย `/exec`
+
+## 3. ใส่ URL ในแอป
+
+1. Login เป็นเจ้าของ
+2. หน้า **สำรอง**
+3. วาง URL ในช่อง Google Apps Script Web App URL
+4. เลือกโหมด:
+   - ปิด
+   - ทุกกี่นาที
+   - เมื่อมีการทำรายการ
+   - ทั้งสองแบบ
+5. กดบันทึก
+6. กด **เปิด URL ทดสอบ** เพื่อสร้างไฟล์ TEST
+7. ตรวจโฟลเดอร์ `Rendo_Backups` ใน Drive
+8. กด **สำรองไป Drive ตอนนี้** เพื่อทดสอบข้อมูลจริง
+
+ข้อจำกัดของเว็บแบบไม่มี Server กลาง:
+
+- การสำรองตามเวลาเกิดขึ้นเมื่อแอปของเจ้าของเปิดอยู่
+- เมื่อพนักงานคนอื่นทำรายการ ระบบสร้างคำขอสำรองไว้ และเจ้าของจะประมวลผลคำขอเมื่อเปิดแอป
+- การสำรองที่ต้องทำงานทันทีแม้ไม่มีอุปกรณ์เจ้าของออนไลน์ ควรเพิ่ม Cloud Functions/Cloud Scheduler ในระยะต่อไป
+
+---
+
+# ส่วนที่ 8: ดาวน์โหลดและ Restore
+
+หน้า **สำรอง** มีปุ่มดาวน์โหลด:
+
+- JSON: เหมาะสำหรับสำรองและ Restore ครบโครงสร้าง
+- CSV: 1 บรรทัดต่อเอกสาร มีคอลัมน์ `collection`, `id`, `dataJSON`
+
+ขั้นตอน Restore:
+
+1. Login เป็นเจ้าของ
+2. สำรองข้อมูลปัจจุบันก่อน
+3. เลือกไฟล์ `.json` หรือ `.csv`
+4. ตรวจจำนวนรายการใน Preview
+5. กด **ยืนยัน Restore**
+6. กรอก PIN เจ้าของ
+7. ยืนยันอีกครั้ง
+8. ระบบเขียนทับเอกสารที่มี Collection/ID ตรงกัน แล้ว Reload
+
+Restore ไม่ลบเอกสารที่ไม่มีอยู่ในไฟล์โดยอัตโนมัติ เพื่อลดความเสี่ยงจากไฟล์สำรองไม่ครบ
+
+---
+
+# ส่วนที่ 9: สิทธิ์ผู้ใช้
+
+## เจ้าของ
+
+- สร้างผู้ใช้ทุกระดับ
+- แก้ระดับทุกคนยกเว้นระดับของตัวเอง
+- ลบผู้ใช้อื่นได้ แต่ลบตัวเองไม่ได้
+- ดู PIN ทุกคน
+- ดู Dashboard, ค่าตอบแทน, รายจ่าย, ประวัติระบบ, สำรอง และตั้งค่า
+
+## ผู้จัดการ
+
+- สร้างผู้จัดการ หัวหน้า และพนักงานระดับต่ำกว่าเจ้าของ
+- แก้/ลบเฉพาะหัวหน้าและพนักงานระดับต่ำกว่า ไม่แก้/ลบเจ้าของ ผู้จัดการ หรือตัวเอง
+- ไม่เห็น PIN คนอื่น
+- ดู Dashboard ค่าตอบแทน รายจ่าย และประวัติรายการ
+
+## หัวหน้า
+
+- สร้างครัวหน้าร้าน ครัวหลังบ้าน พนักงานหน้าร้าน พนักงานเวียน และรายวัน
+- ดูการลงวันทำงานทุกคน
+- แก้ระดับหรือลบผู้ใช้ไม่ได้
+
+## พนักงาน 5 ระดับ
+
+- ลงและดูวันทำงานของตัวเอง
+- เปลี่ยน PIN ตัวเองโดยต้องยืนยัน PIN เดิม
+- พนักงานหน้าร้านลงยอดขายได้
+- หน้าเบิกล่วงหน้าเปิด/ปิดรายคนได้โดยเจ้าของ
+
+---
+
+# ส่วนที่ 10: การคำนวณสำคัญ
+
+## ยอดขาย
+
+```text
+ยอดขายรวม = ยอดขายอาหาร + ยอดขายเครื่องดื่ม
+รายได้รวม = ยอดขายรวม - ส่วนลด
+เงินสดที่ควรปิด = เงินสดเปิดกะ + เงินสดจากยอดขาย - รายจ่ายที่หักเงินสด - เงินสดให้เจ้าของ
+เงินสดขาด/เกิน = เงินสดปิดกะ - เงินสดที่ควรปิด
+```
+
+หากเงินสดไม่ตรง ต้องกรอกสาเหตุก่อนบันทึกยอดขายจริง แต่บันทึกชั่วคราวได้
+
+## Dashboard
+
+```text
+รายได้หลังหักค่าใช้จ่าย
+= รายได้รวม × สัดส่วนรายได้หลังต้นทุนวัตถุดิบ
+- รายจ่ายจากยอดขาย
+- รายจ่ายเจ้าของลง
+```
+
+ค่าเริ่มต้นสัดส่วนคือ 40% และเจ้าของปรับได้
+
+## ค่าตอบแทน
+
+ระบบคำนวณจาก:
+
+- เงินเดือน หรือค่าจ้างรายวัน/รายชั่วโมงที่ยังไม่ได้รับ
+- OT จากเวลาที่ลงทำงาน
+- OT/เงินเพิ่มอื่นและ OT นอกเวลา
+- โบนัสรายวัน โบนัสรายเดือน โบนัสเบียร์
+- หักเงิน เงินเบิกล่วงหน้า และประกันสังคมลูกจ้าง
+
+PDF แสดงถึง **ยอดที่ต้องโอนปลายเดือน** เท่านั้น ไม่แสดงประกันสังคมนายจ้างและยอดต้นทุนรวม
+
+ค่าอัตราประกันสังคมและฐานเงินเดือนสูงสุดเป็นค่าปรับได้ เจ้าของต้องตรวจให้ตรงกับกฎหมายที่ใช้บังคับในขณะจ่ายเงินจริง
+
+เพื่อป้องกันการคำนวณผิดจากอัตราที่ร้านยังไม่ได้ยืนยัน ระบบตั้งค่าเริ่มต้น **เรท OT, ค่าจ้างรายวัน, ค่าจ้างรายชั่วโมง และฐานเงินเดือนสูงสุดประกันสังคมเป็น 0 บาท** เจ้าของต้องกรอกค่าจริงในหน้า **ค่าตอบแทน** ก่อนบันทึกเดือนแรก โดยระบบจะบล็อกการบันทึกพนักงานเงินเดือนหากยังไม่ได้กำหนดฐานประกันสังคมสูงสุด
+
+---
+
+# ส่วนที่ 11: Checklist ก่อนใช้งานจริง
+
+1. เปิด Email/Password Authentication แล้ว
+2. สร้าง Firestore แล้ว
+3. Publish `firebase-rules.txt` แล้ว
+4. สร้างเจ้าของคนแรกสำเร็จ
+5. ทดลองสร้างผู้ใช้ครบทุกระดับ
+6. ทดลอง Login แต่ละระดับและตรวจเมนู
+7. ทดลองลงวันทำงาน ครบทั้งรายวัน รายชั่วโมง พนักงานเวียน และ OT
+8. ทดลองยอดขายที่เงินสดตรงและไม่ตรง
+9. ทดลองบันทึกชั่วคราวและบันทึกจริง
+10. ตรวจรายเดือนและชื่อพนักงานแยกครัว/หน้าร้าน
+11. ตรวจค่าตอบแทน โบนัส เบียร์ เบิกล่วงหน้า และ PDF
+12. ตรวจธนาคาร/เลขบัญชีใน PDF
+13. ทดลองรายจ่ายประจำ รายจ่ายอื่น และ Dashboard
+14. ทดลอง Download JSON/CSV
+15. ทดลอง Google Drive Backup และ Restore ด้วยข้อมูลทดสอบก่อน
+16. ติดตั้ง PWA บน Android และ iPhone อย่างน้อยอย่างละ 1 เครื่อง
+
+---
+
+# ส่วนที่ 12: แก้ปัญหาที่พบบ่อย
+
+## Login ไม่ได้และขึ้น `auth/operation-not-allowed`
+
+ยังไม่ได้เปิด Email/Password Authentication
+
+## ขึ้น `Missing or insufficient permissions`
+
+- ยังไม่ได้ Publish `firebase-rules.txt`
+- Rules ถูกแก้ไขไม่ครบ
+- บัญชีถูกลบ/ปิดใช้งาน
+
+## ขึ้น `auth/unauthorized-domain`
+
+เพิ่มโดเมน GitHub Pages หรือโดเมนจริงใน Authentication → Settings → Authorized domains
+
+## กด PDF แล้วไม่ทำงาน
+
+ตัวสร้าง PDF โหลดจาก CDN ต้องออนไลน์อย่างน้อยครั้งแรก ลอง Reload ขณะออนไลน์
+
+## แอปยังแสดงไฟล์เวอร์ชันเก่า
+
+1. ปิดแอปทุกแท็บ
+2. เปิดใหม่ขณะออนไลน์
+3. Chrome → Site settings → Clear data หากยังไม่เปลี่ยน
+4. ตรวจว่าไฟล์ `sw.js`, `app.js`, `style.css` ถูกอัปโหลดครบ
+
+## Apps Script รับข้อมูลแต่ไม่เห็นไฟล์
+
+- เปิด Web App URL เติม `?action=test`
+- ตรวจว่า Deploy แบบ Execute as Me และ Anyone
+- ตรวจโฟลเดอร์ `Rendo_Backups`
+- หากแก้โค้ด Apps Script ต้อง Deploy → Manage deployments → Edit → New version → Deploy
+
+---
+
+# ความปลอดภัยและการใช้งานจริง
+
+ระบบนี้เพิ่มความปลอดภัยจากตัวอย่าง static แบบ Anonymous Auth โดยใช้ Firebase Email/Password ภายใน แม้หน้า Login จะแสดงเพียงชื่อและ PIN ก็ตาม และแยก PIN ไว้ใน Collection ที่อ่านได้เฉพาะเจ้าของ
+
+อย่างไรก็ตาม PIN 4 ตัวมีความเป็นไปได้เพียง 10,000 ค่า จึงยังอ่อนกว่ารหัสผ่านยาว ระบบเหมาะกับทีมภายในขนาดเล็กตามโจทย์ ควรใช้ URL ภายในองค์กร ไม่แชร์ต่อสาธารณะ ใช้ PIN ที่เดายาก จำกัดผู้ที่เข้าถึงอุปกรณ์ และสำรองข้อมูลสม่ำเสมอ
+
+สำหรับข้อมูลเงินเดือนที่ต้องการมาตรฐานความปลอดภัยสูงขึ้น แนะนำเพิ่ม Firebase App Check, Multi-factor Authentication สำหรับเจ้าของ และ Cloud Functions/Custom Claims ในรุ่นถัดไป

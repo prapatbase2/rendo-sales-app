@@ -1,0 +1,16 @@
+{
+  "name": "Rendo",
+  "short_name": "Rendo",
+  "description": "ระบบบันทึกยอดขาย เช็คชื่อ ค่าตอบแทน รายจ่าย และสำรองข้อมูลของร้าน Rendo",
+  "start_url": "./index.html",
+  "scope": "./",
+  "display": "standalone",
+  "orientation": "portrait",
+  "background_color": "#f8f5ee",
+  "theme_color": "#111111",
+  "lang": "th",
+  "icons": [
+    {"src":"./icons/icon-192.png","sizes":"192x192","type":"image/png","purpose":"any maskable"},
+    {"src":"./icons/icon-512.png","sizes":"512x512","type":"image/png","purpose":"any maskable"}
+  ]
+}

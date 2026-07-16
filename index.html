@@ -1,0 +1,80 @@
+<!doctype html>
+<html lang="th">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <meta name="theme-color" content="#111111" />
+  <meta name="description" content="Rendo ระบบบันทึกยอดขาย เช็คชื่อ ค่าตอบแทน และรายจ่ายสำหรับทีมงานร้าน" />
+  <title>Rendo v1.0</title>
+  <link rel="manifest" href="./manifest.webmanifest?v=1.0" />
+  <link rel="icon" type="image/png" sizes="32x32" href="./icons/favicon-32.png" />
+  <link rel="icon" type="image/png" sizes="192x192" href="./icons/icon-192.png" />
+  <link rel="apple-touch-icon" sizes="180x180" href="./icons/apple-touch-icon.png" />
+  <link rel="stylesheet" href="./style.css?v=1.0" />
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js" defer></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/html2pdf.js/0.10.1/html2pdf.bundle.min.js" defer></script>
+  <script>
+    window.RENDO_FIREBASE_CONFIG = {
+      apiKey: "AIzaSyB0yv0m7brx8WXyw8zTK8tqVm4K9I1EmzM",
+      authDomain: "rendo-sales.firebaseapp.com",
+      projectId: "rendo-sales",
+      storageBucket: "rendo-sales.firebasestorage.app",
+      messagingSenderId: "1088583610974",
+      appId: "1:1088583610974:web:e1aa7525fd2c4dc58a7acf"
+    };
+  </script>
+</head>
+<body>
+  <div id="toast" class="toast" aria-live="polite"></div>
+
+  <section id="configScreen" class="screen center-screen hidden">
+    <div class="login-card">
+      <img src="./icons/logo.png" alt="Rendo" class="login-logo">
+      <h1>Rendo</h1>
+      <p class="version">v1.0</p>
+      <div class="state error">ยังไม่ได้ใส่ Firebase config ในไฟล์ <b>index.html</b></div>
+    </div>
+  </section>
+
+  <section id="loginScreen" class="screen center-screen">
+    <div class="login-card">
+      <img src="./icons/logo.png" alt="Rendo" class="login-logo">
+      <h1 id="loginStoreName">Rendo</h1>
+      <p class="login-subtitle">Ramen &amp; Gyoza</p>
+      <p class="version">v1.0</p>
+      <div id="loginArea"><div class="loading">กำลังโหลดระบบ...</div></div>
+    </div>
+  </section>
+
+  <div id="mainApp" class="app hidden">
+    <header class="topbar">
+      <div class="brand">
+        <img id="appLogo" src="./icons/logo.png" alt="Rendo">
+        <div><b id="appTitle">Rendo</b><small id="appSub">v1.0</small></div>
+      </div>
+      <div class="user-mini">
+        <span id="onlinePill" class="pill ok">ออนไลน์</span>
+        <button id="changePinTopBtn" class="btn ghost small write-action">เปลี่ยน PIN</button>
+        <button id="logoutBtn" class="btn ghost small">ออก</button>
+      </div>
+    </header>
+    <div id="offlineBanner" class="offline-banner hidden">ออฟไลน์อยู่ กรุณาต่ออินเทอร์เน็ตก่อน</div>
+    <main id="pageContent" class="content"><div class="loading">กำลังโหลด...</div></main>
+    <nav id="bottomNav" class="bottom-nav" aria-label="เมนูหลัก"></nav>
+  </div>
+
+  <script type="module" src="./app.js?v=1.0"></script>
+  <script>
+    window.addEventListener('DOMContentLoaded', function(){
+      setTimeout(function(){
+        if (window.__RENDO_APP_BOOTED) return;
+        const area = document.getElementById('loginArea');
+        if (!area || !area.textContent.includes('กำลังโหลดระบบ')) return;
+        area.innerHTML = location.protocol === 'file:'
+          ? '<div class="state warn"><b>เปิดไฟล์แบบดับเบิลคลิกไม่ได้</b><br>ให้เปิดผ่าน GitHub Pages หรือใช้ไฟล์ เปิดทดสอบในเครื่อง.bat</div>'
+          : '<div class="state error"><b>โหลดระบบไม่สำเร็จ</b><br>ตรวจอินเทอร์เน็ต การเปิด Firebase Email/Password Authentication และ Firestore Rules</div>';
+      }, 8000);
+    });
+  </script>
+</body>
+</html>

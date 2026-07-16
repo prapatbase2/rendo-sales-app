@@ -1,0 +1,21 @@
+{
+  "indexes": [
+    {
+      "collectionGroup": "salaryAdvances",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "monthKey", "order": "ASCENDING"},
+        {"fieldPath": "userId", "order": "ASCENDING"}
+      ]
+    },
+    {
+      "collectionGroup": "auditLogs",
+      "queryScope": "COLLECTION",
+      "fields": [
+        {"fieldPath": "category", "order": "ASCENDING"},
+        {"fieldPath": "hidden", "order": "ASCENDING"}
+      ]
+    }
+  ],
+  "fieldOverrides": []
+}

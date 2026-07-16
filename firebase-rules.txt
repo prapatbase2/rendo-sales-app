@@ -1,0 +1,149 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function hasProfile() { return signedIn() && exists(/databases/$(database)/documents/users/$(request.auth.uid)); }
+    function me() { return get(/databases/$(database)/documents/users/$(request.auth.uid)).data; }
+    function role() { return hasProfile() ? me().role : null; }
+    function isOwner() { return role() == 'owner'; }
+    function isManager() { return role() == 'manager'; }
+    function isSupervisor() { return role() == 'supervisor'; }
+    function isOwnerOrManager() { return isOwner() || isManager(); }
+    function isWorkerRole(r) { return r in ['front_kitchen','back_kitchen','front_staff','rotating','daily']; }
+    function canCreateRole(r) {
+      return isOwner()
+        || (isManager() && r != 'owner')
+        || (isSupervisor() && isWorkerRole(r));
+    }
+    function targetRole(uid) { return get(/databases/$(database)/documents/users/$(uid)).data.role; }
+    function canUpdateTarget(uid, newRole) {
+      return (isOwner() && (uid != request.auth.uid || newRole == targetRole(uid)))
+        || (isManager() && uid != request.auth.uid
+            && !(targetRole(uid) in ['owner','manager'])
+            && !(newRole in ['owner','manager']));
+    }
+    function canDeleteTarget(uid) {
+      return (isOwner() && uid != request.auth.uid)
+        || (isManager() && uid != request.auth.uid && !(targetRole(uid) in ['owner','manager']));
+    }
+    function advanceEnabled() {
+      return request.auth.uid in get(/databases/$(database)/documents/appSettings/main).data.advanceAccessUserIds;
+    }
+
+    // รายชื่อหน้า Login อ่านได้โดยยังไม่ต้อง Sign in แต่ไม่มี PIN อยู่ใน collection นี้
+    match /publicUsers/{uid} {
+      allow read: if true;
+      allow create: if signedIn() && (
+        (!exists(/databases/$(database)/documents/system/bootstrap) && uid == request.auth.uid && request.resource.data.role == 'owner')
+        || canCreateRole(request.resource.data.role)
+      );
+      allow update: if hasProfile() && canUpdateTarget(uid, getAfter(/databases/$(database)/documents/users/$(uid)).data.role)
+        && request.resource.data.role == getAfter(/databases/$(database)/documents/users/$(uid)).data.role;
+      allow delete: if hasProfile() && canDeleteTarget(uid);
+    }
+
+    match /system/bootstrap {
+      allow read: if true;
+      allow create: if signedIn()
+        && !exists(/databases/$(database)/documents/system/bootstrap)
+        && request.resource.data.ownerUid == request.auth.uid;
+      allow update, delete: if isOwner();
+    }
+
+    match /users/{uid} {
+      allow read: if hasProfile();
+      allow create: if signedIn() && (
+        (!exists(/databases/$(database)/documents/system/bootstrap) && uid == request.auth.uid && request.resource.data.role == 'owner')
+        || (hasProfile() && canCreateRole(request.resource.data.role))
+      );
+      allow update: if hasProfile() && canUpdateTarget(uid, request.resource.data.role);
+      allow delete: if hasProfile() && canDeleteTarget(uid);
+    }
+
+    // PIN แยกจากข้อมูลผู้ใช้: อ่านได้เฉพาะเจ้าของ, เจ้าของ/ผู้ใช้คนนั้นเปลี่ยน PIN ได้
+    match /pinVault/{uid} {
+      allow read: if isOwner();
+      allow create: if signedIn() && (
+        (!exists(/databases/$(database)/documents/system/bootstrap) && uid == request.auth.uid)
+        || (hasProfile() && isOwner())
+        || (hasProfile() && (isManager() || isSupervisor()) && request.resource.data.createdBy == request.auth.uid)
+      );
+      allow update: if isOwner() || (hasProfile() && uid == request.auth.uid);
+      allow delete: if hasProfile() && canDeleteTarget(uid);
+    }
+
+    match /appSettings/{id} {
+      allow read: if hasProfile();
+      allow create: if signedIn() && (!exists(/databases/$(database)/documents/system/bootstrap) || isOwner());
+      allow update, delete: if isOwner();
+    }
+
+    match /attendance/{id} {
+      allow read: if hasProfile();
+      allow create, update: if hasProfile() && (
+        isOwnerOrManager()
+        || (request.resource.data.userId == request.auth.uid && isWorkerRole(role()))
+      );
+      allow delete: if isOwnerOrManager();
+    }
+
+    match /dailySales/{id} {
+      allow read: if hasProfile();
+      allow write: if hasProfile() && role() in ['owner','manager','supervisor','front_staff'];
+    }
+    match /dailyDrafts/{id} {
+      allow read: if hasProfile();
+      allow write: if hasProfile() && role() in ['owner','manager','supervisor','front_staff'];
+    }
+
+    match /salaryAdvances/{id} {
+      allow read: if hasProfile() && (
+        isOwnerOrManager()
+        || (advanceEnabled() && resource.data.userId == request.auth.uid)
+      );
+      allow create: if hasProfile() && (
+        isOwnerOrManager()
+        || (advanceEnabled() && request.resource.data.userId == request.auth.uid && request.resource.data.createdBy == request.auth.uid)
+      );
+      allow update: if isOwnerOrManager();
+      allow delete: if hasProfile() && (
+        isOwnerOrManager()
+        || (advanceEnabled() && resource.data.userId == request.auth.uid && resource.data.createdBy == request.auth.uid)
+      );
+    }
+
+    match /ownerExpenses/{id} {
+      allow read, write: if isOwnerOrManager();
+    }
+    match /recurringExpenseTemplates/{id} {
+      allow read, write: if isOwnerOrManager();
+    }
+    match /recurringExpenseMonths/{id} {
+      allow read, write: if isOwnerOrManager();
+    }
+
+    match /compensationRecords/{id} {
+      allow read, write: if isOwnerOrManager();
+    }
+    match /compensationMonthSettings/{id} {
+      allow read: if isOwnerOrManager();
+      allow write: if isOwner();
+    }
+
+    match /auditLogs/{id} {
+      allow create: if isOwner() || (hasProfile() && request.resource.data.actorId == request.auth.uid);
+      allow read: if isOwner()
+        || (isManager() && resource.data.category == 'activity' && resource.data.hidden == false);
+      allow update, delete: if isOwner();
+    }
+    match /backupsMetadata/{id} {
+      allow create: if hasProfile();
+      allow read, update, delete: if isOwner();
+    }
+
+    // ปฏิเสธทุก path ที่ไม่ได้ประกาศไว้
+    match /{document=**} {
+      allow read, write: if false;
+    }
+  }
+}
