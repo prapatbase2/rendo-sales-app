@@ -50,6 +50,13 @@ service cloud.firestore {
       allow update, delete: if isOwner();
     }
 
+    // เจ้าของต้องอ่าน collection system ได้ระหว่าง Export/Backup ทั้งฐานข้อมูล
+    // ไม่เช่นนั้น getDocs(collection("system")) จะถูก Firestore ปฏิเสธ
+    match /system/{id} {
+      allow read: if isOwner();
+      allow update, delete: if isOwner();
+    }
+
     match /users/{uid} {
       allow read: if hasProfile();
       allow create: if signedIn() && (
