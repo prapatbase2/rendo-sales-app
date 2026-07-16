@@ -1,4 +1,4 @@
-const BUILD_VERSION = "1.0";
+const BUILD_VERSION = "1.1.0";
 const CACHE_NAME = `rendo-pwa-v${BUILD_VERSION}`;
 const APP_SHELL = [
   "./","./index.html",`./style.css?v=${BUILD_VERSION}`,`./app.js?v=${BUILD_VERSION}`,

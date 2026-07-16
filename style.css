@@ -501,7 +501,7 @@ body.is-offline #pageContent textarea{
   .pdf-one-page .pdf-info-grid{grid-template-columns:1fr}
 }
 
-/* Rendo v1.0 — โทนดำ/ทองและส่วนประกอบเฉพาะระบบ */
+/* Rendo v1.1.0 — โทนดำ/ทองและส่วนประกอบเฉพาะระบบ */
 .login-subtitle{margin:0 0 4px;color:var(--muted);font-weight:700;letter-spacing:.04em}
 .login-card{background:linear-gradient(180deg,#fff,#fffaf2)}
 .login-logo{background:#050505;border-color:#2b2113;padding:0}
@@ -554,4 +554,61 @@ code{background:#17110a;color:#f1c77e;padding:4px 7px;border-radius:8px;font-wei
   .user-mini .pill{display:none}
   .user-mini .btn{padding:8px 9px;font-size:.8rem}
   .brand img{width:44px;height:44px}
+}
+
+/* Rendo v1.1.0 — ความเสถียร หน้าค่าตอบแทนทีละคน และ PDF */
+.loading::before{content:"";display:inline-block;width:18px;height:18px;margin-right:9px;vertical-align:-4px;border:3px solid var(--line);border-top-color:var(--primary);border-radius:50%;animation:rendoSpin .8s linear infinite}
+@keyframes rendoSpin{to{transform:rotate(360deg)}}
+.is-busy{opacity:.72;pointer-events:none}
+
+.comp-settings-panel{padding:0;overflow:hidden}
+.comp-settings-panel>summary{list-style:none;cursor:pointer;display:flex;justify-content:space-between;gap:12px;align-items:center;padding:15px 16px;background:var(--secondary);color:var(--primary-dark)}
+.comp-settings-panel>summary::-webkit-details-marker{display:none}
+.comp-settings-panel>summary span{font-size:.82rem;color:var(--muted)}
+.comp-settings-form{padding:14px}
+.comp-settings-form h4{margin:16px 0 8px;padding-bottom:6px;border-bottom:1px solid var(--line);color:var(--primary-dark)}
+.social-security-grid{padding:12px;border:2px solid #d9b56f;border-radius:16px;background:#fffaf0}
+.important-field input{border-width:2px;border-color:var(--primary);font-weight:900;font-size:1.08rem}
+
+.comp-person-panel{padding:12px;overflow:hidden}
+.comp-person-toolbar{display:grid;grid-template-columns:auto 1fr auto;gap:10px;align-items:center;margin-bottom:10px}
+.comp-person-toolbar>div{text-align:center;display:grid;gap:2px}
+.comp-person-toolbar small{color:var(--muted);font-weight:800}
+.comp-person-toolbar b{font-size:1.05rem;color:var(--primary-dark)}
+.comp-person-tabs{display:flex;gap:8px;overflow-x:auto;overscroll-behavior-inline:contain;scroll-snap-type:x proximity;-webkit-overflow-scrolling:touch;padding:3px 2px 10px;margin:0 -2px 10px}
+.comp-person-tab{flex:0 0 auto;min-width:145px;max-width:210px;border:1px solid var(--line);border-radius:14px;background:#fff;padding:10px 12px;text-align:left;scroll-snap-align:center;cursor:pointer;color:var(--text)}
+.comp-person-tab span,.comp-person-tab small{display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.comp-person-tab span{font-weight:900}
+.comp-person-tab small{margin-top:3px;color:var(--muted)}
+.comp-person-tab.active{border:2px solid var(--primary);background:var(--secondary);box-shadow:0 5px 16px rgba(184,137,66,.2)}
+#compPersonContainer .comp-card{box-shadow:none;border:1px solid var(--line);background:#fffdf8}
+
+.comp-pdf-modal{max-width:920px}
+.pdf-comp-table th:nth-child(1){width:28%}
+.pdf-comp-table th:nth-child(2){width:47%}
+.pdf-comp-table th:nth-child(3){width:25%}
+.pdf-work-section{margin-top:14px;break-before:auto}
+.pdf-work-section h3{font-size:15px;margin:0 0 8px;color:#2b2113}
+.pdf-work-table{font-size:11px}
+.pdf-work-table th,.pdf-work-table td{padding:5px 6px}
+.pdf-work-table th:nth-child(1){width:22%}
+.pdf-work-table th:nth-child(2){width:34%}
+.pdf-work-table th:nth-child(3),.pdf-work-table th:nth-child(4){width:13%}
+.pdf-work-table th:nth-child(5){width:18%}
+.pdf-export-active{position:fixed!important;left:0!important;top:0!important;width:794px!important;min-height:1123px!important;background:#fff!important;z-index:9998!important;overflow:visible!important;pointer-events:none!important}
+.pdf-export-active .pdf-document{width:794px!important;max-width:794px!important;min-height:1123px;background:#fff!important;color:#17210f!important;box-shadow:none!important;margin:0!important}
+.pdf-generating-overlay{position:fixed;inset:0;z-index:10000;background:rgba(255,255,255,.98);display:grid;place-items:center;text-align:center}
+.pdf-generating-overlay>div{display:grid;gap:8px;justify-items:center;padding:24px}
+.pdf-generating-overlay small{color:var(--muted)}
+.loading-spinner{width:42px;height:42px;border:5px solid #eadfca;border-top-color:var(--primary);border-radius:50%;animation:rendoSpin .8s linear infinite}
+
+@media(max-width:720px){
+  .comp-person-toolbar{grid-template-columns:1fr 1fr}
+  .comp-person-toolbar>div{grid-column:1 / -1;grid-row:1}
+  .comp-person-toolbar #compPrev{grid-column:1;grid-row:2}
+  .comp-person-toolbar #compNext{grid-column:2;grid-row:2}
+  .comp-person-toolbar .btn{width:100%}
+  .comp-person-tab{min-width:132px}
+  .comp-settings-form{padding:10px}
+  .pdf-sheet{padding:5px}
 }

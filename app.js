@@ -1,11 +1,11 @@
 import { initializeApp, deleteApp } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-app.js";
 import { getAuth, createUserWithEmailAndPassword, signInWithEmailAndPassword, signOut, updatePassword, reauthenticateWithCredential, EmailAuthProvider, deleteUser as deleteAuthUser } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-auth.js";
 import {
-  getFirestore, enableIndexedDbPersistence, collection, doc, getDoc, getDocs,
+  getFirestore, enableIndexedDbPersistence, collection, doc, getDoc, getDocs, getDocFromCache, getDocsFromCache,
   addDoc, setDoc, updateDoc, deleteDoc, query, where, writeBatch, serverTimestamp
 } from "https://www.gstatic.com/firebasejs/10.12.5/firebase-firestore.js";
 
-const VERSION = "v1.0";
+const VERSION = "v1.1.0";
 const STORAGE_KEY = "rendo_remember_v1";
 const SESSION_KEY = "rendo_session_unlock_v1";
 const COLLECTIONS = [
@@ -51,7 +51,9 @@ const clone = obj => typeof structuredClone === "function" ? structuredClone(obj
 let state = {
   app:null, auth:null, db:null, authUid:null,
   users:[], publicUsers:[], pinVault:{}, settings:clone(DEFAULT_SETTINGS), currentUser:null, currentPage:"dashboard",
-  online:navigator.onLine, charts:{}, backupTimer:null, saleLoaded:null, restorePreview:null
+  online:navigator.onLine, charts:{}, backupTimer:null, backupDebounce:null, backupInProgress:false, backupQueued:false,
+  saleLoaded:null, restorePreview:null, navRequestId:0, attendanceLoadSeq:0, monthlyLoadSeq:0, compensationLoadSeq:0,
+  compSelectedIndex:0, compDrafts:{}, dataCache:new Map()
 };
 
 const $ = (sel,root=document)=>root.querySelector(sel);
@@ -62,6 +64,41 @@ const money = n => numberValue(n).toLocaleString("th-TH",{minimumFractionDigits:
 const escapeHtml = s => String(s ?? "").replace(/[&<>"']/g,m=>({"&":"&amp;","<":"&lt;",">":"&gt;","\"":"&quot;","'":"&#39;"}[m]));
 const uid = (prefix="id")=>`${prefix}_${Date.now()}_${Math.random().toString(36).slice(2,8)}`;
 const safeClone = obj => JSON.parse(JSON.stringify(obj,(_,v)=>v?.toDate? v.toDate().toISOString() : (v===undefined?null:v)));
+
+const sleep = ms => new Promise(resolve=>setTimeout(resolve,ms));
+function withTimeout(promise,ms=15000,label="การทำรายการ") {
+  let timer;
+  const timeout=new Promise((_,reject)=>{timer=setTimeout(()=>reject(Object.assign(new Error(`${label} ใช้เวลานานเกินไป กรุณาตรวจอินเทอร์เน็ตแล้วลองใหม่`),{code:"app/timeout"})),ms);});
+  return Promise.race([Promise.resolve(promise),timeout]).finally(()=>clearTimeout(timer));
+}
+function friendlyError(err){
+  const code=err?.code||"";
+  if(code==="permission-denied"||String(err?.message||"").includes("insufficient permissions")) return "ไม่มีสิทธิ์อ่านหรือบันทึกข้อมูลส่วนนี้ กรุณาตรวจ Firestore Rules";
+  if(code==="unavailable"||code==="app/timeout") return "เชื่อมต่อฐานข้อมูลไม่สำเร็จ กรุณาตรวจอินเทอร์เน็ตแล้วลองใหม่";
+  if(code==="failed-precondition"&&String(err?.message||"").includes("index")) return "Firestore ยังไม่มีดัชนีที่จำเป็น กรุณาสร้าง Index ตามลิงก์ที่ Firebase แสดง";
+  return err?.message||"เกิดข้อผิดพลาดที่ไม่ทราบสาเหตุ";
+}
+async function getDocsResilient(ref,label="โหลดข้อมูล",timeoutMs=15000){
+  try{return await withTimeout(getDocs(ref),timeoutMs,label);}
+  catch(err){
+    if(["permission-denied","failed-precondition"].includes(err?.code)) throw err;
+    try{return await getDocsFromCache(ref);}catch(_){throw err;}
+  }
+}
+async function getDocResilient(ref,label="โหลดข้อมูล",timeoutMs=12000){
+  try{return await withTimeout(getDoc(ref),timeoutMs,label);}
+  catch(err){
+    if(["permission-denied","failed-precondition"].includes(err?.code)) throw err;
+    try{return await getDocFromCache(ref);}catch(_){throw err;}
+  }
+}
+function setButtonBusy(button,busy,text="กำลังบันทึก..."){
+  if(!button)return;
+  if(busy){button.dataset.oldText=button.textContent;button.disabled=true;button.textContent=text;}
+  else{button.disabled=!state.online;button.textContent=button.dataset.oldText||button.textContent;delete button.dataset.oldText;}
+}
+window.addEventListener("unhandledrejection",event=>{console.error("Unhandled promise",event.reason);showToast(friendlyError(event.reason));});
+window.addEventListener("error",event=>{console.error("Window error",event.error||event.message);});
 
 async function sha256(text){ const bytes=new TextEncoder().encode(String(text)); const hash=await crypto.subtle.digest("SHA-256",bytes); return [...new Uint8Array(hash)].map(b=>b.toString(16).padStart(2,"0")).join(""); }
 function todayISO(){ const d=new Date(); d.setMinutes(d.getMinutes()-d.getTimezoneOffset()); return d.toISOString().slice(0,10); }
@@ -139,11 +176,15 @@ window.addEventListener("online",updateOnlineUi); window.addEventListener("offli
 
 async function registerServiceWorker(){
   if("serviceWorker" in navigator && location.protocol!=="file:"){
-    try{ await navigator.serviceWorker.register("./sw.js",{updateViaCache:"none"}); }catch(e){ console.warn("SW",e); }
+    try{
+      const reg=await navigator.serviceWorker.register("./sw.js",{updateViaCache:"none"}); await reg.update().catch(()=>null);
+      const activate=()=>reg.waiting?.postMessage("SKIP_WAITING"); if(reg.waiting)activate(); reg.addEventListener("updatefound",()=>reg.installing?.addEventListener("statechange",()=>{if(reg.waiting)activate();}));
+      navigator.serviceWorker.addEventListener("controllerchange",()=>{if(sessionStorage.getItem("rendo_sw_reloaded_110"))return;sessionStorage.setItem("rendo_sw_reloaded_110","1");location.reload();});
+    }catch(e){ console.warn("SW",e); }
   }
 }
 async function loadPublicUsers(){
-  const snap=await getDocs(collection(state.db,"publicUsers"));
+  const snap=await getDocsResilient(collection(state.db,"publicUsers"),"โหลดรายชื่อผู้ใช้");
   state.publicUsers=snap.docs.map(d=>({id:d.id,...d.data()})).filter(u=>u.active!==false).sort((a,b)=>(ROLE_ORDER[a.role]||99)-(ROLE_ORDER[b.role]||99)||String(a.name).localeCompare(String(b.name),"th"));
   state.users=state.publicUsers.slice();
 }
@@ -162,11 +203,11 @@ async function boot(){
   }catch(e){ console.error(e); $("#loginArea").innerHTML=`<div class="state error"><b>เริ่มระบบไม่สำเร็จ</b><br>${escapeHtml(e.message)}<br><small>ตรวจว่าเปิด Email/Password Authentication สร้าง Firestore และวาง Rules แล้ว</small></div>`; }
 }
 async function loadBaseData(){
-  const [uSnap,sSnap]=await Promise.all([getDocs(collection(state.db,"users")),getDoc(doc(state.db,"appSettings","main"))]);
+  const [uSnap,sSnap]=await Promise.all([getDocsResilient(collection(state.db,"users"),"โหลดผู้ใช้"),getDocResilient(doc(state.db,"appSettings","main"),"โหลดการตั้งค่า")]);
   state.users=uSnap.docs.map(d=>({id:d.id,...d.data()})).sort((a,b)=>(ROLE_ORDER[a.role]||99)-(ROLE_ORDER[b.role]||99)||String(a.name).localeCompare(String(b.name),"th"));
   state.settings=deepMergeSettings(sSnap.exists()?sSnap.data():{});
   if(isOwner()){
-    try{ const p=await getDocs(collection(state.db,"pinVault")); state.pinVault=Object.fromEntries(p.docs.map(d=>[d.id,d.data().pin||""])); }catch(_){ state.pinVault={}; }
+    try{ const p=await getDocsResilient(collection(state.db,"pinVault"),"โหลด PIN"); state.pinVault=Object.fromEntries(p.docs.map(d=>[d.id,d.data().pin||""])); }catch(_){ state.pinVault={}; }
   }else state.pinVault={};
   applyTheme();
 }
@@ -217,11 +258,11 @@ async function login(e){
     state.authUid=authUser.uid; await loadBaseData(); const user=state.users.find(u=>u.id===authUser.uid&&u.active!==false); if(!user)throw new Error("บัญชีถูกปิดหรือลบแล้ว"); state.currentUser=user;
     localStorage.setItem(SESSION_KEY,JSON.stringify({userId:id,pinHash:await sha256(pin)}));
     if($("#rememberLogin").checked) localStorage.setItem(STORAGE_KEY,JSON.stringify({userId:id,pin})); else localStorage.removeItem(STORAGE_KEY);
-    if(isOwner()){ try{ const p=await getDocs(collection(state.db,"pinVault")); state.pinVault=Object.fromEntries(p.docs.map(d=>[d.id,d.data().pin||""])); }catch(_){ state.pinVault={}; } }
+    if(isOwner()){ try{ const p=await getDocsResilient(collection(state.db,"pinVault"),"โหลด PIN"); state.pinVault=Object.fromEntries(p.docs.map(d=>[d.id,d.data().pin||""])); }catch(_){ state.pinVault={}; } }
     if(state.online) await audit("เข้าสู่ระบบ",{user:user.name},null,null,user,"system"); $("#loginScreen").classList.add("hidden"); $("#mainApp").classList.remove("hidden"); buildNav(); setupAutoBackupTimer(); navigate(visibleNavItems()[0]?.id||"monthly");
   }catch(err){ console.warn("login",err); if(state.online)await signOut(state.auth).catch(()=>null); state.authUid=null; showToast(state.online?"PIN ไม่ถูกต้อง หรือบัญชีถูกปิดใช้งาน":"ออฟไลน์: เครื่องนี้ยังไม่มีสิทธิ์ปลดล็อกบัญชีนี้ กรุณาออนไลน์และเข้าสู่ระบบก่อน"); }
 }
-async function logout(){ state.currentUser=null;state.authUid=null;clearInterval(state.backupTimer);localStorage.removeItem(SESSION_KEY);await signOut(state.auth).catch(()=>null);await loadPublicUsers();$("#mainApp").classList.add("hidden");$("#loginScreen").classList.remove("hidden");renderLogin(); }
+async function logout(){ clearTimeout(state.backupDebounce);clearInterval(state.backupTimer);state.currentUser=null;state.authUid=null;localStorage.removeItem(SESSION_KEY);await signOut(state.auth).catch(()=>null);await loadPublicUsers();$("#mainApp").classList.add("hidden");$("#loginScreen").classList.remove("hidden");renderLogin(); }
 $("#logoutBtn").onclick=logout;
 async function confirmCurrentPin(pin){
   const u=state.currentUser;if(!u||!/^\d{4}$/.test(String(pin).trim()))return false;
@@ -243,11 +284,12 @@ async function audit(action,details={},before=null,after=null,actorOverride=null
   }); }catch(e){ console.warn("audit",e); }
 }
 async function afterWrite(name){
-  const mode=state.settings.autoBackup?.mode||"off";
-  if(mode!=="onAction"&&mode!=="both") return;
-  if(isOwner()) setTimeout(()=>performBackup(`auto_${name}`,true).catch(console.warn),0);
-  else {
-    try{ await addDoc(collection(state.db,"backupsMetadata"),{pending:true,reason:`action_${name}`,createdAt:serverTimestamp(),createdBy:state.currentUser?.id||null,createdByName:state.currentUser?.name||"ระบบ"}); }catch(e){ console.warn("backup request",e); }
+  const mode=state.settings.autoBackup?.mode||"off"; if(mode!=="onAction"&&mode!=="both") return;
+  if(isOwner()){
+    clearTimeout(state.backupDebounce);state.backupDebounce=setTimeout(()=>performBackup(`auto_${name}`,true).catch(console.warn),12000);
+  }else{
+    // ไม่รอการสร้างคำขอสำรอง เพื่อไม่ให้หน้าบันทึกค้าง
+    addDoc(collection(state.db,"backupsMetadata"),{pending:true,reason:`action_${name}`,createdAt:serverTimestamp(),createdBy:state.currentUser?.id||null,createdByName:state.currentUser?.name||"ระบบ"}).catch(e=>console.warn("backup request",e));
   }
 }
 
@@ -268,18 +310,27 @@ const NAV=[
 function canAccessAdvances(user=state.currentUser){ return ["owner","manager"].includes(user?.role)||(state.settings.advanceAccessUserIds||[]).includes(user?.id); }
 function visibleNavItems(){ return NAV.filter(n=>n.roles.includes(state.currentUser?.role)&&!(state.settings.hiddenPages||[]).includes(n.id)&&(n.id!=="advances"||canAccessAdvances())); }
 function buildNav(){ const items=visibleNavItems(); $("#bottomNav").innerHTML=items.map(n=>`<button class="nav-item" data-page="${n.id}"><span>${n.icon}</span><b>${n.label}</b></button>`).join(""); $$(".nav-item").forEach(b=>b.onclick=()=>navigate(b.dataset.page)); }
-function navigate(page){
+async function navigate(page){
   const allowed=visibleNavItems().some(n=>n.id===page); if(!allowed) page=visibleNavItems()[0]?.id||"monthly";
-  state.currentPage=page; $$(".nav-item").forEach(b=>b.classList.toggle("active",b.dataset.page===page));
+  state.currentPage=page; const requestId=++state.navRequestId;
+  $$(".nav-item").forEach(b=>{b.classList.toggle("active",b.dataset.page===page);b.disabled=b.dataset.page===page;});
   const map={dashboard:renderDashboard,sales:renderSales,attendance:renderAttendance,monthly:renderMonthly,advances:renderAdvances,compensation:renderCompensation,ownerExpenses:renderOwnerExpenses,history:()=>renderHistory("activity"),systemHistory:()=>renderHistory("system"),backup:renderBackup,users:renderUsers,settings:renderSettings};
-  setLoading(); Promise.resolve((map[page]||renderMonthly)()).catch(e=>{ console.error(e); content().innerHTML=`<div class="state error"><b>เกิดข้อผิดพลาด</b><br>${escapeHtml(e.message)}</div>`; }).finally(updateOnlineUi);
+  setLoading();
+  try{ await withTimeout(Promise.resolve().then(()=>((map[page]||renderMonthly)())),30000,`โหลดหน้า ${page}`); }
+  catch(e){
+    console.error("navigate",page,e);
+    if(requestId===state.navRequestId&&state.currentPage===page) content().innerHTML=`<div class="state error"><b>โหลดหน้านี้ไม่สำเร็จ</b><br>${escapeHtml(friendlyError(e))}<div style="margin-top:12px"><button class="btn secondary retry-page" type="button">ลองใหม่</button></div></div>`;
+    $(".retry-page")&&($(".retry-page").onclick=()=>navigate(page));
+  }finally{
+    if(requestId===state.navRequestId){$$(".nav-item").forEach(b=>b.disabled=false);updateOnlineUi();}
+  }
 }
 function pageTitle(title,sub=""){ return `<div class="page-title"><div><h2>${escapeHtml(title)}</h2>${sub?`<p>${escapeHtml(sub)}</p>`:""}</div><span class="pill muted">${escapeHtml(ROLE_LABELS[state.currentUser.role])}: ${escapeHtml(state.currentUser.name)}</span></div>`; }
 function metricCards(items){ return `<div class="metrics">${items.map(x=>`<div class="metric"><small>${escapeHtml(x.label)}</small><b>${escapeHtml(x.value)}</b>${x.sub?`<span>${escapeHtml(x.sub)}</span>`:""}</div>`).join("")}</div>`; }
 function drawBar(id,labels,values,label){ const el=document.getElementById(id); if(!el) return; if(window.Chart){ state.charts[id]?.destroy(); state.charts[id]=new Chart(el,{type:"bar",data:{labels,datasets:[{label,data:values}]},options:{responsive:true,maintainAspectRatio:false,plugins:{legend:{display:false}},scales:{y:{beginAtZero:true}}}}); } }
-async function docsByMonth(name,monthKey){ const snap=await getDocs(query(collection(state.db,name),where("monthKey","==",monthKey))); return snap.docs.map(d=>({id:d.id,...d.data()})); }
-async function docsByMonthForUser(name,monthKey,userId){ const snap=await getDocs(query(collection(state.db,name),where("monthKey","==",monthKey),where("userId","==",userId))); return snap.docs.map(d=>({id:d.id,...d.data()})); }
-async function allDocs(name){ const snap=await getDocs(collection(state.db,name)); return snap.docs.map(d=>({id:d.id,...d.data()})); }
+async function docsByMonth(name,monthKey){ const snap=await getDocsResilient(query(collection(state.db,name),where("monthKey","==",monthKey)),`โหลด ${name} เดือน ${monthKey}`); return snap.docs.map(d=>({id:d.id,...d.data()})); }
+async function docsByMonthForUser(name,monthKey,userId){ const snap=await getDocsResilient(query(collection(state.db,name),where("monthKey","==",monthKey),where("userId","==",userId)),`โหลด ${name} ของพนักงาน`); return snap.docs.map(d=>({id:d.id,...d.data()})); }
+async function allDocs(name){ const snap=await getDocsResilient(collection(state.db,name),`โหลด ${name}`); return snap.docs.map(d=>({id:d.id,...d.data()})); }
 function saleExpenseCash(s){ return (s.expenses||[]).filter(e=>!e.ownerTransfer).reduce((a,e)=>a+numberValue(e.amount),0); }
 function saleExpenseTotal(s){ return (s.expenses||[]).reduce((a,e)=>a+numberValue(e.amount),0); }
 
@@ -355,7 +406,7 @@ function bindMonthlyDetails(){
   $$(".monthly-detail-close").forEach(btn=>btn.onclick=()=>{ const row=btn.closest(".monthly-detail-row"); if(!row)return; row.classList.add("hidden"); const open=$(`.monthly-detail-btn[data-detail="${row.dataset.detail}"]`); if(open) open.textContent="แสดงรายละเอียด"; });
 }
 async function yesterdaySaleWarning(){
-  const y=addDaysISO(todayISO(),-1); const s=await getDoc(doc(state.db,"dailySales",y));
+  const y=addDaysISO(todayISO(),-1); const s=await getDocResilient(doc(state.db,"dailySales",y),"ตรวจยอดขายเมื่อวาน");
   return s.exists()?"":`<div class="state warn"><b>เมื่อวานยังไม่ได้บันทึกยอดขายหรือกดหยุดร้าน</b><br>กรุณาย้อนกลับไปลงข้อมูลวันที่ ${thaiDate(y)}</div>`;
 }
 async function renderSales(){
@@ -432,13 +483,13 @@ function collectSaleData({draft=false}={}){
 }
 async function saveSaleDraft(){
   if(!requireOnline()) return; const d=collectSaleData({draft:true}); if(!d.date) return showToast("เลือกวันที่");
-  const ref=doc(state.db,"dailyDrafts",d.date),before=await getDoc(ref); await setDoc(ref,d,{merge:true}); await audit("บันทึกยอดขายชั่วคราว",{date:d.date},before.exists()?before.data():null,d); await afterWrite("sale_draft"); showToast("บันทึกชั่วคราวแล้ว ยังไม่รวมรายเดือน/ค่าตอบแทน"); state.saleLoaded={type:"draft",id:d.date,data:d}; $("#saleState").textContent="มีฉบับชั่วคราว";
+  const ref=doc(state.db,"dailyDrafts",d.date),before=await getDocResilient(ref,"ตรวจฉบับชั่วคราว"); await withTimeout(setDoc(ref,d,{merge:true}),15000,"บันทึกยอดขายชั่วคราว"); await audit("บันทึกยอดขายชั่วคราว",{date:d.date},before.exists()?before.data():null,d); await afterWrite("sale_draft"); showToast("บันทึกชั่วคราวแล้ว ยังไม่รวมรายเดือน/ค่าตอบแทน"); state.saleLoaded={type:"draft",id:d.date,data:d}; $("#saleState").textContent="มีฉบับชั่วคราว";
 }
 async function saveSaleFinal(e){
   e.preventDefault(); if(!requireOnline()) return; const d=collectSaleData(); if(!d.date) return showToast("เลือกวันที่");
   if(!d.closed && d.netIncome<0) return showToast("ส่วนลดมากกว่ายอดขายไม่ได้");
   if(!d.closed && Math.abs(d.cashDiff)>=0.005 && !d.cashDiffReason) return showToast("เงินสดไม่ตรง กรุณากรอกสาเหตุ");
-  const ref=doc(state.db,"dailySales",d.date),before=await getDoc(ref);
+  const ref=doc(state.db,"dailySales",d.date),before=await getDocResilient(ref,"ตรวจยอดขายเดิม");
   if(before.exists()&&!confirm(`วันที่ ${thaiDate(d.date)} มีข้อมูลแล้ว ยืนยันแก้ไขหรือไม่`)) return;
   const batch=writeBatch(state.db); batch.set(ref,d,{merge:false}); batch.delete(doc(state.db,"dailyDrafts",d.date)); await batch.commit();
   await audit(before.exists()?"แก้ไขยอดขาย":"บันทึกยอดขาย",{date:d.date,closed:d.closed},before.exists()?before.data():null,d); await afterWrite("sale"); showToast("บันทึกยอดขายจริงแล้ว"); state.saleLoaded={type:"final",id:d.date,data:d}; $("#saleState").textContent="มีข้อมูลจริง — แก้ไขได้";
@@ -472,20 +523,20 @@ async function renderAttendance(){
   content().innerHTML=`${pageTitle("ลงวันทำงาน",canViewAll?"ตรวจสอบการลงวันทำงานของพนักงานทุกคน":"เห็นเฉพาะข้อมูลของตัวเอง")}
     <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="attMonth" type="month" value="${currentMonthKey()}"></div><div class="field"><label>พนักงาน</label><select id="attUser" ${canViewAll?"":"disabled"}>${canViewAll?workerOptions(first?.id):`<option value="${state.currentUser.id}">${escapeHtml(state.currentUser.name)}</option>`}</select></div><div class="field"><label>&nbsp;</label><button id="loadAttendance" class="btn secondary">โหลดข้อมูล</button></div></div></div>
     <div id="attFormBox">${(worker||canAdminEdit)&&first?attendanceFormHtml(first):`<div class="state ok">หัวหน้าดูข้อมูลได้ แต่ไม่ต้องลงวันทำงานของตนเอง</div>`}</div><div id="attResult"></div>`;
-  $("#loadAttendance").onclick=refreshAttendancePage; $("#attMonth").onchange=loadAttendanceResult; $("#attUser").onchange=refreshAttendancePage;
-  bindAttendanceForm(); await loadAttendanceResult();
+  $("#loadAttendance").onclick=()=>refreshAttendancePage().catch(e=>showToast(friendlyError(e))); $("#attMonth").onchange=()=>loadAttendanceResult().catch(e=>showToast(friendlyError(e))); $("#attUser").onchange=()=>refreshAttendancePage().catch(e=>showToast(friendlyError(e)));
+  await bindAttendanceForm(); await loadAttendanceResult();
 }
 function selectedAttendanceUser(){ return state.users.find(u=>u.id===$("#attUser")?.value)||state.currentUser; }
-function bindAttendanceForm(){
+async function bindAttendanceForm(){
   const form=$("#attendanceForm"); if(!form) return;
-  $("#attDate").onchange=async()=>{ $("#attThaiDate").textContent=thaiDate($("#attDate").value); await loadAttendanceIntoForm(); };
+  $("#attDate").onchange=async()=>{ $("#attThaiDate").textContent=thaiDate($("#attDate").value); try{await loadAttendanceIntoForm();}catch(e){showToast(friendlyError(e));} };
   $("#attStatus").onchange=updateAttendanceFields; $("#workStore")&&($("#workStore").onchange=updateAttendanceFields); $("#hasOT")&&($("#hasOT").onchange=updateAttendanceFields);
-  form.onsubmit=saveAttendance; updateAttendanceFields(); loadAttendanceIntoForm();
+  form.onsubmit=saveAttendance; updateAttendanceFields(); await loadAttendanceIntoForm();
 }
 async function refreshAttendancePage(){
   const user=selectedAttendanceUser(); const canEdit=isOwnerOrManager()||user.id===state.currentUser.id;
   $("#attFormBox").innerHTML=canEdit?attendanceFormHtml(user):`<div class="state ok">หัวหน้าดูข้อมูลของ ${escapeHtml(user.name)} ได้ แต่การแก้ไขให้เจ้าของหรือผู้จัดการดำเนินการ</div>`;
-  bindAttendanceForm(); await loadAttendanceResult();
+  await bindAttendanceForm(); await loadAttendanceResult();
 }
 function updateAttendanceFields(){
   const user=selectedAttendanceUser(),status=$("#attStatus")?.value;
@@ -497,23 +548,37 @@ function updateAttendanceFields(){
   if(mayOT){ const startHour=user.role==="rotating"&&$("#workStore")?.value==="Love Matcha"?18:22; const currentStart=$("#otStart")?.value,currentEnd=$("#otEnd")?.value; $("#otStart").innerHTML=timeOptions(startHour,24,currentStart||`${String(startHour).padStart(2,"0")}:00`); $("#otEnd").innerHTML=timeOptions(startHour,24,currentEnd||`${String(Math.min(startHour+1,24)).padStart(2,"0")}:00`); $("#otHint").textContent=`เลือกเวลาได้ทีละ 1 ชั่วโมง ตั้งแต่ ${String(startHour).padStart(2,"0")}:00–24:00`; }
 }
 async function loadAttendanceIntoForm(){
-  const form=$("#attendanceForm"); if(!form) return; const user=selectedAttendanceUser(),date=$("#attDate").value; const snap=await getDoc(doc(state.db,"attendance",`${user.id}_${date}`));
-  if(!snap.exists()){ $("#attStatus").value="full_day"; $("#attReason").value=""; if($("#workStore")) $("#workStore").value="Rendo"; if($("#hasOT")) $("#hasOT").checked=false; updateAttendanceFields(); return; }
-  const d=snap.data(); $("#attStatus").value=d.status||"full_day"; $("#attReason").value=d.reason||""; if($("#attStart")) $("#attStart").value=d.startTime||"11:00"; if($("#attEnd")) $("#attEnd").value=d.endTime||"12:00"; if($("#workStore")) $("#workStore").value=d.workStore||"Rendo"; if($("#hasOT")) $("#hasOT").checked=!!d.hasOT; updateAttendanceFields(); if($("#otStart")) $("#otStart").value=d.otStart||$("#otStart").value; if($("#otEnd")) $("#otEnd").value=d.otEnd||$("#otEnd").value;
+  const form=$("#attendanceForm"); if(!form) return; const user=selectedAttendanceUser(),date=$("#attDate").value,seq=++state.attendanceLoadSeq;
+  form.classList.add("is-busy");
+  try{
+    const snap=await getDocResilient(doc(state.db,"attendance",`${user.id}_${date}`),"โหลดวันทำงาน");
+    if(seq!==state.attendanceLoadSeq||state.currentPage!=="attendance"||!$("#attendanceForm")) return;
+    if(!snap.exists()){ $("#attStatus").value="full_day"; $("#attReason").value=""; if($("#workStore")) $("#workStore").value="Rendo"; if($("#hasOT")) $("#hasOT").checked=false; updateAttendanceFields(); return; }
+    const d=snap.data(); $("#attStatus").value=d.status||"full_day"; $("#attReason").value=d.reason||""; if($("#attStart")) $("#attStart").value=d.startTime||"11:00"; if($("#attEnd")) $("#attEnd").value=d.endTime||"12:00"; if($("#workStore")) $("#workStore").value=d.workStore||"Rendo"; if($("#hasOT")) $("#hasOT").checked=!!d.hasOT; updateAttendanceFields(); if($("#otStart")) $("#otStart").value=d.otStart||$("#otStart").value; if($("#otEnd")) $("#otEnd").value=d.otEnd||$("#otEnd").value;
+  }finally{if(seq===state.attendanceLoadSeq) $("#attendanceForm")?.classList.remove("is-busy");}
 }
 async function saveAttendance(e){
-  e.preventDefault(); if(!requireOnline()) return; const user=selectedAttendanceUser(); if(!(isOwnerOrManager()||user.id===state.currentUser.id)) return showToast("ไม่มีสิทธิ์แก้ไข");
-  const date=$("#attDate").value,status=$("#attStatus").value,reason=$("#attReason").value.trim(); if(!date) return showToast("เลือกวันที่"); if(attendanceReasonRequired(status)&&!reason) return showToast("กรุณาระบุสาเหตุ");
-  const d={userId:user.id,userName:user.name,role:user.role,date,monthKey:monthOf(date),status,reason,workStore:"",startTime:"",endTime:"",hasOT:false,otStart:"",otEnd:"",otHours:0,paidDaily:false,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id,updatedByName:state.currentUser.name};
-  const existing=await getDoc(doc(state.db,"attendance",`${user.id}_${date}`)); if(existing.exists()) d.paidDaily=!!existing.data().paidDaily;
-  if(user.role==="daily"&&status==="hourly"){ d.startTime=$("#attStart").value; d.endTime=$("#attEnd").value; if(minutesFromTime(d.endTime)<=minutesFromTime(d.startTime)) return showToast("เวลาเลิกงานต้องมากกว่าเวลาเริ่ม"); }
-  if(user.role==="rotating"&&status==="full_day") d.workStore=$("#workStore").value;
-  if(["front_kitchen","back_kitchen","front_staff","rotating"].includes(user.role)&&status==="full_day"&&$("#hasOT")?.checked){ d.hasOT=true; d.otStart=$("#otStart").value; d.otEnd=$("#otEnd").value; if(minutesFromTime(d.otEnd)<=minutesFromTime(d.otStart)) return showToast("เวลาเลิก OT ต้องมากกว่าเวลาเริ่ม"); d.otHours=(minutesFromTime(d.otEnd)-minutesFromTime(d.otStart))/60; }
-  const ref=doc(state.db,"attendance",`${user.id}_${date}`); await setDoc(ref,d,{merge:false}); await audit(existing.exists()?"แก้ไขวันทำงาน":"ลงวันทำงาน",{user:user.name,date,status:attendanceStatusLabel(status)},existing.exists()?existing.data():null,d); await afterWrite("attendance"); showToast("บันทึกวันทำงานแล้ว"); await loadAttendanceResult();
+  e.preventDefault(); if(!requireOnline()) return; const button=e.submitter||e.currentTarget.querySelector("button[type=submit]"); setButtonBusy(button,true,"กำลังบันทึก...");
+  try{
+    const user=selectedAttendanceUser(); if(!(isOwnerOrManager()||user.id===state.currentUser.id)) return showToast("ไม่มีสิทธิ์แก้ไข");
+    const date=$("#attDate").value,status=$("#attStatus").value,reason=$("#attReason").value.trim(); if(!date) return showToast("เลือกวันที่"); if(attendanceReasonRequired(status)&&!reason) return showToast("กรุณาระบุสาเหตุ");
+    const d={userId:user.id,userName:user.name,role:user.role,date,monthKey:monthOf(date),status,reason,workStore:"",startTime:"",endTime:"",hasOT:false,otStart:"",otEnd:"",otHours:0,paidDaily:false,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id,updatedByName:state.currentUser.name};
+    const ref=doc(state.db,"attendance",`${user.id}_${date}`),existing=await getDocResilient(ref,"ตรวจข้อมูลวันทำงาน"); if(existing.exists()) d.paidDaily=!!existing.data().paidDaily;
+    if(user.role==="daily"&&status==="hourly"){ d.startTime=$("#attStart").value; d.endTime=$("#attEnd").value; if(minutesFromTime(d.endTime)<=minutesFromTime(d.startTime)) return showToast("เวลาเลิกงานต้องมากกว่าเวลาเริ่ม"); }
+    if(user.role==="rotating"&&status==="full_day") d.workStore=$("#workStore").value;
+    if(["front_kitchen","back_kitchen","front_staff","rotating"].includes(user.role)&&status==="full_day"&&$("#hasOT")?.checked){ d.hasOT=true; d.otStart=$("#otStart").value; d.otEnd=$("#otEnd").value; if(minutesFromTime(d.otEnd)<=minutesFromTime(d.otStart)) return showToast("เวลาเลิก OT ต้องมากกว่าเวลาเริ่ม"); d.otHours=(minutesFromTime(d.otEnd)-minutesFromTime(d.otStart))/60; }
+    await withTimeout(setDoc(ref,d,{merge:false}),15000,"บันทึกวันทำงาน");
+    showToast("บันทึกวันทำงานแล้ว");
+    audit(existing.exists()?"แก้ไขวันทำงาน":"ลงวันทำงาน",{user:user.name,date,status:attendanceStatusLabel(status)},existing.exists()?existing.data():null,d).catch(console.warn);
+    afterWrite("attendance").catch(console.warn);
+    try{await loadAttendanceResult();}catch(err){console.warn(err);showToast("บันทึกแล้ว แต่โหลดรายการใหม่ไม่สำเร็จ กดโหลดข้อมูลอีกครั้งได้");}
+  }catch(err){console.error("saveAttendance",err);showToast(friendlyError(err));}
+  finally{setButtonBusy(button,false);}
 }
+
 async function loadAttendanceResult(){
   const month=$("#attMonth")?.value||currentMonthKey(),user=selectedAttendanceUser(); if(!user) return;
-  $("#attResult").innerHTML=`<div class="loading">กำลังโหลด...</div>`; const rows=(await docsByMonth("attendance",month)).filter(r=>r.userId===user.id).sort((a,b)=>String(a.date).localeCompare(String(b.date)));
+  const seq=++state.attendanceLoadSeq; $("#attResult").innerHTML=`<div class="loading">กำลังโหลด...</div>`; const rows=(await docsByMonth("attendance",month)).filter(r=>r.userId===user.id).sort((a,b)=>String(a.date).localeCompare(String(b.date))); if(seq!==state.attendanceLoadSeq||state.currentPage!=="attendance"||!$("#attResult")) return;
   const missing=missingAttendanceDates(month,rows); const summary={full:rows.filter(r=>r.status==="full_day").length,hourly:rows.filter(r=>r.status==="hourly").length,off:rows.filter(r=>r.status==="off").length,leave:rows.filter(r=>["vacation","sick","personal","other"].includes(r.status)).length,ot:rows.reduce((s,r)=>s+numberValue(r.otHours),0)};
   $("#attResult").innerHTML=`${missing.length?`<div class="state warn"><b>ยังไม่ได้ลงวันที่:</b> ${missing.map(d=>Number(d.slice(8))).join(", ")}</div>`:`<div class="state ok">ลงข้อมูลครบตามวันที่ผ่านมาแล้ว</div>`}
   ${metricCards([{label:"ทำงานทั้งวัน",value:`${summary.full} วัน`},{label:"รายชั่วโมง",value:`${summary.hourly} วัน`},{label:"หยุด",value:`${summary.off} วัน`},{label:"ลา/อื่น ๆ",value:`${summary.leave} วัน`},{label:"OT",value:`${money(summary.ot)} ชม.`}])}
@@ -524,12 +589,12 @@ async function loadAttendanceResult(){
 async function renderMonthly(){
   const month=currentMonthKey(); content().innerHTML=`${pageTitle("รายเดือน","สรุปพนักงานที่ทำงานทั้งวัน ยอดขาย และเงินสดรายวัน")}
   <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="monthlyMonth" type="month" value="${month}" ${isAdminViewer()?"":`min="${previousMonthKey()}" max="${currentMonthKey()}"`}></div><div class="field"><label>&nbsp;</label><button id="loadMonthly" class="btn secondary">แสดงรายเดือน</button></div><div class="field"><label>&nbsp;</label><span class="pill muted">ดูย้อนหลัง ${isAdminViewer()?"ได้ตลอด":"ไม่เกิน 1 เดือนก่อนหน้า"}</span></div></div></div><div id="monthlyResult"></div>`;
-  $("#loadMonthly").onclick=loadMonthly; $("#monthlyMonth").onchange=loadMonthly; await loadMonthly();
+  $("#loadMonthly").onclick=()=>loadMonthly().catch(e=>showToast(friendlyError(e))); $("#monthlyMonth").onchange=()=>loadMonthly().catch(e=>showToast(friendlyError(e))); await loadMonthly();
 }
 async function loadMonthly(){
-  const month=$("#monthlyMonth").value; if(!isAdminViewer()&&month<previousMonthKey()) return showToast("พนักงานดูย้อนหลังได้ไม่เกิน 1 เดือนก่อนหน้า");
-  $("#monthlyResult").innerHTML=`<div class="loading">กำลังโหลดรายเดือน...</div>`;
-  const [sales,attendance]=await Promise.all([docsByMonth("dailySales",month),docsByMonth("attendance",month)]); const saleMap=Object.fromEntries(sales.map(s=>[s.date,s]));
+  const month=$("#monthlyMonth")?.value; if(!month)return; if(!isAdminViewer()&&month<previousMonthKey()) return showToast("พนักงานดูย้อนหลังได้ไม่เกิน 1 เดือนก่อนหน้า");
+  const seq=++state.monthlyLoadSeq; $("#monthlyResult").innerHTML=`<div class="loading">กำลังโหลดรายเดือน...</div>`;
+  const [sales,attendance]=await Promise.all([docsByMonth("dailySales",month),docsByMonth("attendance",month)]); if(seq!==state.monthlyLoadSeq||state.currentPage!=="monthly"||!$("#monthlyResult"))return; const saleMap=Object.fromEntries(sales.map(s=>[s.date,s]));
   const rows=[]; for(let day=1;day<=daysInMonth(month);day++){
     const date=dateOfMonth(month,day),s=saleMap[date],att=attendance.filter(a=>a.date===date&&a.status==="full_day");
     const kitchen=att.filter(a=>KITCHEN_ROLES.includes(a.role)).map(a=>a.userName); const front=att.filter(a=>["front_staff","rotating","daily"].includes(a.role)).map(a=>a.userName);
@@ -580,7 +645,7 @@ function mergeCompSettings(raw={}){
     socialSecurity:{...base.socialSecurity,...(raw.socialSecurity||{})}
   };
 }
-async function getCompMonthSettings(monthKey){ const snap=await getDoc(doc(state.db,"compensationMonthSettings",monthKey)); return mergeCompSettings(snap.exists()?snap.data():{}); }
+async function getCompMonthSettings(monthKey){ const snap=await getDocResilient(doc(state.db,"compensationMonthSettings",monthKey),"โหลดเรทค่าตอบแทน"); return mergeCompSettings(snap.exists()?snap.data():{}); }
 function isRendoFullDay(a){ return a.status==="full_day" && (a.role!=="rotating" || a.workStore==="Rendo"); }
 function dailyAttendancePay(a,settings){ if(a.status==="full_day") return numberValue(settings.dailyPay.fullDay); if(a.status==="hourly") return Math.max(0,(minutesFromTime(a.endTime)-minutesFromTime(a.startTime))/60)*numberValue(settings.dailyPay.hourly); return 0; }
 async function calculateCompensationMonth(monthKey,{includeManual=true}={}){
@@ -605,17 +670,20 @@ async function calculateCompensationMonth(monthKey,{includeManual=true}={}){
     const dailyPaid=att.filter(a=>a.paidDaily).reduce((s,a)=>s+dailyAttendancePay(a,settings),0);
     const dailyWage=Math.max(0,dailyWageBefore-dailyPaid);
     const autoOT=SALARIED_ROLES.includes(user.role)?att.reduce((s,a)=>s+numberValue(a.otHours)*numberValue(settings.otRates[user.role]),0):0;
-    let dailyBonus=0,monthlySalesEligible=0,monthlyBonus=0;
+    let dailyBonus=0,dailyBonusEligibleDays=0,monthlySalesEligible=0,monthlyBonus=0;
     if(KITCHEN_ROLES.includes(user.role)){
-      fullDays.forEach(a=>{ const sale=saleMap[a.date]; if(!sale)return; const amount=numberValue(sale.foodSales); monthlySalesEligible+=amount; if(amount>numberValue(settings.dailyBonus.kitchen.threshold)) dailyBonus+=numberValue(settings.dailyBonus.kitchen.amount); });
+      fullDays.forEach(a=>{ const sale=saleMap[a.date]; if(!sale)return; const amount=numberValue(sale.foodSales); monthlySalesEligible+=amount; if(amount>numberValue(settings.dailyBonus.kitchen.threshold)){dailyBonus+=numberValue(settings.dailyBonus.kitchen.amount);dailyBonusEligibleDays++;} });
       if(monthlySalesEligible>numberValue(settings.monthlyBonus.kitchen.threshold)) monthlyBonus=numberValue(settings.monthlyBonus.kitchen.amount);
     }else if(FRONT_BONUS_ROLES.includes(user.role)){
-      fullDays.forEach(a=>{ const sale=saleMap[a.date]; if(!sale)return; const amount=numberValue(sale.drinkSales); monthlySalesEligible+=amount; if(amount>numberValue(settings.dailyBonus.front.threshold)) dailyBonus+=numberValue(settings.dailyBonus.front.amount); });
+      fullDays.forEach(a=>{ const sale=saleMap[a.date]; if(!sale)return; const amount=numberValue(sale.drinkSales); monthlySalesEligible+=amount; if(amount>numberValue(settings.dailyBonus.front.threshold)){dailyBonus+=numberValue(settings.dailyBonus.front.amount);dailyBonusEligibleDays++;} });
       if(monthlySalesEligible>numberValue(settings.monthlyBonus.front.threshold)) monthlyBonus=numberValue(settings.monthlyBonus.front.amount);
     }
     const beerBonus=numberValue(beerShare[userId]);
     const extraOther=numberValue(rec.extraOther),outsideOT=numberValue(rec.outsideOT),deduction=numberValue(rec.deduction);
     const advancesTotal=advances.filter(a=>a.userId===userId).reduce((s,a)=>s+numberValue(a.amount),0);
+    const fullDayAttendance=att.filter(a=>a.status==="full_day"),hourlyAttendance=att.filter(a=>a.status==="hourly");
+    const fullDayCount=fullDayAttendance.length,hourlyDayCount=hourlyAttendance.length,hourlyHours=hourlyAttendance.reduce((sum,a)=>sum+Math.max(0,(minutesFromTime(a.endTime)-minutesFromTime(a.startTime))/60),0),otHours=att.reduce((sum,a)=>sum+numberValue(a.otHours),0),paidDailyCount=att.filter(a=>a.paidDaily&&["full_day","hourly"].includes(a.status)).length;
+    const dailyFullDayEarned=fullDayAttendance.reduce((sum,a)=>sum+dailyAttendancePay(a,settings),0),dailyHourlyEarned=hourlyAttendance.reduce((sum,a)=>sum+dailyAttendancePay(a,settings),0);
     const ssBase=isDaily?0:Math.min(salary,numberValue(settings.socialSecurity.maxSalaryBase));
     const employeeSS=ssBase*numberValue(settings.socialSecurity.employeeRate)/100,employerSS=ssBase*numberValue(settings.socialSecurity.employerRate)/100;
     const basePay=isDaily?dailyWage:salary;
@@ -624,10 +692,11 @@ async function calculateCompensationMonth(monthKey,{includeManual=true}={}){
     const totalCost=gross-deduction+employerSS;
     rows.push({
       userId,userName:user.name,role:user.role,isDaily,monthKey,settings,
-      salary,dailyWageBefore,dailyPaid,dailyWage,dailyAttendance:att.filter(a=>["full_day","hourly"].includes(a.status)).sort((a,b)=>String(a.date).localeCompare(String(b.date))),
+      salary,dailyWageBefore,dailyPaid,dailyWage,dailyFullDayEarned,dailyHourlyEarned,fullDayCount,hourlyDayCount,hourlyHours,paidDailyCount,otHours,
+      dailyAttendance:att.filter(a=>["full_day","hourly"].includes(a.status)).sort((a,b)=>String(a.date).localeCompare(String(b.date))),
       autoOT,extraOther,extraOtherNote:rec.extraOtherNote||"",outsideOT,outsideOTNote:rec.outsideOTNote||"",
-      dailyBonus,monthlyBonus,monthlySalesEligible,beerBonus,deduction,deductionNote:rec.deductionNote||"",advances:advancesTotal,
-      employeeSS,employerSS,gross,netTransfer,totalCost,
+      dailyBonus,dailyBonusEligibleDays,monthlyBonus,monthlySalesEligible,beerBonus,deduction,deductionNote:rec.deductionNote||"",advances:advancesTotal,
+      ssBase,employeeSS,employerSS,gross,netTransfer,totalCost,
       bankName:rec.bankName??user.bankName??"",bankAccountNumber:rec.bankAccountNumber??user.bankAccountNumber??"",
       updatedAt:rec.updatedAt||null
     });
@@ -636,12 +705,14 @@ async function calculateCompensationMonth(monthKey,{includeManual=true}={}){
   return {monthKey,settings,rows,sales,attendance,advances};
 }
 function compSettingsHtml(s){
-  return `<form id="compSettingsForm" class="panel"><div class="flex"><h3>ตั้งค่าเรทของเดือนนี้</h3><span class="pill muted">ปรับแล้วคำนวณเดือนนี้ใหม่ และใช้เป็นค่าเริ่มต้นเดือนถัดไป</span></div>
-  <div class="grid four"><div class="field"><label>OT ครัวหน้าร้าน / ชม.</label><input id="otFrontKitchen" type="number" min="0" value="${numberValue(s.otRates.front_kitchen)}"></div><div class="field"><label>OT ครัวหลังบ้าน / ชม.</label><input id="otBackKitchen" type="number" min="0" value="${numberValue(s.otRates.back_kitchen)}"></div><div class="field"><label>OT พนักงานหน้าร้าน / ชม.</label><input id="otFrontStaff" type="number" min="0" value="${numberValue(s.otRates.front_staff)}"></div><div class="field"><label>OT พนักงานเวียน / ชม.</label><input id="otRotating" type="number" min="0" value="${numberValue(s.otRates.rotating)}"></div></div>
-  <div class="grid four"><div class="field"><label>รายวันทั้งวัน</label><input id="dailyFullRate" type="number" min="0" value="${numberValue(s.dailyPay.fullDay)}"></div><div class="field"><label>รายวันต่อชั่วโมง</label><input id="dailyHourRate" type="number" min="0" value="${numberValue(s.dailyPay.hourly)}"></div><div class="field"><label>โบนัสเบียร์ต่อขวด</label><input id="beerRate" type="number" min="0" step="0.01" value="${numberValue(s.beerPerBottle)}"></div><div class="field"><label>ฐานเงินเดือนสูงสุดคิด ปกส.</label><input id="ssMaxBase" type="number" min="0" value="${numberValue(s.socialSecurity.maxSalaryBase)}"><small>ตรวจและปรับให้ตรงกฎหมายปัจจุบัน</small></div></div>
-  <div class="grid four"><div class="field"><label>โบนัสรายวันครัว: ยอดเกิน</label><input id="dailyKitchenThreshold" type="number" min="0" value="${numberValue(s.dailyBonus.kitchen.threshold)}"></div><div class="field"><label>ครัวได้</label><input id="dailyKitchenAmount" type="number" min="0" value="${numberValue(s.dailyBonus.kitchen.amount)}"></div><div class="field"><label>โบนัสรายวันหน้าร้าน: ยอดเกิน</label><input id="dailyFrontThreshold" type="number" min="0" value="${numberValue(s.dailyBonus.front.threshold)}"></div><div class="field"><label>หน้าร้านได้</label><input id="dailyFrontAmount" type="number" min="0" value="${numberValue(s.dailyBonus.front.amount)}"></div></div>
-  <div class="grid four"><div class="field"><label>โบนัสรายเดือนครัว: ยอดเกิน</label><input id="monthlyKitchenThreshold" type="number" min="0" value="${numberValue(s.monthlyBonus.kitchen.threshold)}"></div><div class="field"><label>ครัวได้</label><input id="monthlyKitchenAmount" type="number" min="0" value="${numberValue(s.monthlyBonus.kitchen.amount)}"></div><div class="field"><label>โบนัสรายเดือนหน้าร้าน: ยอดเกิน</label><input id="monthlyFrontThreshold" type="number" min="0" value="${numberValue(s.monthlyBonus.front.threshold)}"></div><div class="field"><label>หน้าร้านได้</label><input id="monthlyFrontAmount" type="number" min="0" value="${numberValue(s.monthlyBonus.front.amount)}"></div></div>
-  <div class="grid three"><div class="field"><label>ปกส. ลูกจ้าง (%)</label><input id="employeeSSRate" type="number" min="0" max="100" step="0.01" value="${numberValue(s.socialSecurity.employeeRate)}"></div><div class="field"><label>ปกส. นายจ้าง (%)</label><input id="employerSSRate" type="number" min="0" max="100" step="0.01" value="${numberValue(s.socialSecurity.employerRate)}"></div><div class="field"><label>&nbsp;</label><button class="btn write-action">บันทึกเรทและคำนวณใหม่</button></div></div></form>`;
+  return `<details class="panel comp-settings-panel"><summary><b>ตั้งค่าเรทและประกันสังคมของเดือนนี้</b><span>แตะเพื่อเปิด/ปิด</span></summary>
+  <form id="compSettingsForm" class="comp-settings-form"><div class="state warn"><b>สำคัญ:</b> เจ้าของกรอกอัตราและเพดานฐานเงินเดือนประกันสังคมให้ตรงกฎหมายของเดือนนั้นได้เอง เมื่อกฎหมายเปลี่ยนให้แก้ช่องนี้แล้วกดบันทึก</div>
+  <h4>ประกันสังคม</h4><div class="grid three social-security-grid"><div class="field"><label>อัตราฝ่ายลูกจ้าง (%)</label><input id="employeeSSRate" type="number" min="0" max="100" step="0.01" value="${numberValue(s.socialSecurity.employeeRate)}"></div><div class="field"><label>อัตราฝ่ายนายจ้าง (%)</label><input id="employerSSRate" type="number" min="0" max="100" step="0.01" value="${numberValue(s.socialSecurity.employerRate)}"></div><div class="field important-field"><label>เพดานฐานเงินเดือนสูงสุดที่ใช้คิดประกันสังคม (บาท)</label><input id="ssMaxBase" type="number" min="0" step="0.01" value="${numberValue(s.socialSecurity.maxSalaryBase)}" placeholder="กรอกเพดานตามกฎหมาย"><small>ตัวอย่าง: หากเงินเดือนสูงกว่าเพดาน ระบบจะคิดจากเพดานนี้</small></div></div>
+  <h4>OT และค่าจ้างรายวัน</h4><div class="grid four"><div class="field"><label>OT ครัวหน้าร้าน / ชม.</label><input id="otFrontKitchen" type="number" min="0" value="${numberValue(s.otRates.front_kitchen)}"></div><div class="field"><label>OT ครัวหลังบ้าน / ชม.</label><input id="otBackKitchen" type="number" min="0" value="${numberValue(s.otRates.back_kitchen)}"></div><div class="field"><label>OT พนักงานหน้าร้าน / ชม.</label><input id="otFrontStaff" type="number" min="0" value="${numberValue(s.otRates.front_staff)}"></div><div class="field"><label>OT พนักงานเวียน / ชม.</label><input id="otRotating" type="number" min="0" value="${numberValue(s.otRates.rotating)}"></div></div>
+  <div class="grid three"><div class="field"><label>ค่าจ้างรายวันทั้งวัน</label><input id="dailyFullRate" type="number" min="0" value="${numberValue(s.dailyPay.fullDay)}"></div><div class="field"><label>ค่าจ้างรายวันต่อชั่วโมง</label><input id="dailyHourRate" type="number" min="0" value="${numberValue(s.dailyPay.hourly)}"></div><div class="field"><label>โบนัสเบียร์ต่อขวด</label><input id="beerRate" type="number" min="0" step="0.01" value="${numberValue(s.beerPerBottle)}"></div></div>
+  <h4>โบนัส</h4><div class="grid four"><div class="field"><label>โบนัสรายวันครัว: ยอดเกิน</label><input id="dailyKitchenThreshold" type="number" min="0" value="${numberValue(s.dailyBonus.kitchen.threshold)}"></div><div class="field"><label>ครัวได้ / วัน</label><input id="dailyKitchenAmount" type="number" min="0" value="${numberValue(s.dailyBonus.kitchen.amount)}"></div><div class="field"><label>โบนัสรายวันหน้าร้าน: ยอดเกิน</label><input id="dailyFrontThreshold" type="number" min="0" value="${numberValue(s.dailyBonus.front.threshold)}"></div><div class="field"><label>หน้าร้านได้ / วัน</label><input id="dailyFrontAmount" type="number" min="0" value="${numberValue(s.dailyBonus.front.amount)}"></div></div>
+  <div class="grid four"><div class="field"><label>โบนัสรายเดือนครัว: ยอดเกิน</label><input id="monthlyKitchenThreshold" type="number" min="0" value="${numberValue(s.monthlyBonus.kitchen.threshold)}"></div><div class="field"><label>ครัวได้ / เดือน</label><input id="monthlyKitchenAmount" type="number" min="0" value="${numberValue(s.monthlyBonus.kitchen.amount)}"></div><div class="field"><label>โบนัสรายเดือนหน้าร้าน: ยอดเกิน</label><input id="monthlyFrontThreshold" type="number" min="0" value="${numberValue(s.monthlyBonus.front.threshold)}"></div><div class="field"><label>หน้าร้านได้ / เดือน</label><input id="monthlyFrontAmount" type="number" min="0" value="${numberValue(s.monthlyBonus.front.amount)}"></div></div>
+  <div class="sticky-save"><button class="btn write-action">บันทึกเรท คำนวณใหม่ และใช้ต่อเดือนถัดไป</button></div></form></details>`;
 }
 function compCardHtml(r){
   return `<article class="panel comp-card" data-user-id="${r.userId}">
@@ -658,52 +729,91 @@ function compCardHtml(r){
     <div class="flex comp-actions"><button class="btn save-comp write-action" type="button">บันทึกคนนี้</button><button class="btn secondary comp-pdf" type="button">ดู/แชร์ PDF</button>${r.isDaily?`<button class="btn secondary manage-paid-daily" type="button">จัดการวันที่จ่ายแล้ว</button>`:""}</div>
   </article>`;
 }
+function compPersonNavigatorHtml(data){
+  const index=Math.min(Math.max(0,state.compSelectedIndex||0),Math.max(0,data.rows.length-1));
+  return `<section class="panel comp-person-panel"><div class="comp-person-toolbar"><button id="compPrev" class="btn secondary" type="button" ${index<=0?"disabled":""}>← คนก่อนหน้า</button><div><small>กำลังดู</small><b id="compPersonCounter">${data.rows.length?`${index+1} / ${data.rows.length}`:"0 / 0"}</b></div><button id="compNext" class="btn secondary" type="button" ${index>=data.rows.length-1?"disabled":""}>คนถัดไป →</button></div><div id="compPersonTabs" class="comp-person-tabs" aria-label="เลือกพนักงาน">${data.rows.map((r,i)=>`<button class="comp-person-tab ${i===index?"active":""}" type="button" data-index="${i}"><span>${escapeHtml(r.userName)}</span><small>${escapeHtml(ROLE_LABELS[r.role]||r.role)}</small></button>`).join("")}</div><div id="compPersonContainer"></div></section>`;
+}
+function rememberCurrentCompDraft(){
+  const card=$("#compPersonContainer .comp-card"); if(!card||!state.compData)return;
+  try{state.compDrafts[card.dataset.userId]=rowFromCard(card);}catch(e){console.warn("remember draft",e);}
+}
+function bindCurrentCompCard(){
+  const card=$("#compPersonContainer .comp-card"); if(!card)return;
+  card.querySelector(".save-comp")?.addEventListener("click",()=>saveCompCard(card));
+  card.querySelector(".comp-pdf")?.addEventListener("click",()=>openCompPdf(card));
+  card.querySelector(".manage-paid-daily")?.addEventListener("click",()=>openPaidDailyModal(card.dataset.userId));
+  card.querySelectorAll("input:not([readonly])").forEach(i=>i.addEventListener("input",()=>{refreshCompCard(card);state.compDrafts[card.dataset.userId]=rowFromCard(card);}));
+}
+function showCompPerson(index,{remember=true}={}){
+  if(!state.compData||!$("#compPersonContainer"))return; if(remember)rememberCurrentCompDraft();
+  const max=Math.max(0,state.compData.rows.length-1); state.compSelectedIndex=Math.min(Math.max(0,Number(index)||0),max);
+  const base=state.compData.rows[state.compSelectedIndex];
+  $("#compPersonContainer").innerHTML=base?compCardHtml(state.compDrafts[base.userId]||base):`<div class="empty">ยังไม่มีพนักงาน</div>`;
+  $$(".comp-person-tab").forEach(b=>b.classList.toggle("active",Number(b.dataset.index)===state.compSelectedIndex));
+  const active=$(`.comp-person-tab[data-index="${state.compSelectedIndex}"]`); active?.scrollIntoView({behavior:"smooth",block:"nearest",inline:"center"});
+  if($("#compPersonCounter"))$("#compPersonCounter").textContent=state.compData.rows.length?`${state.compSelectedIndex+1} / ${state.compData.rows.length}`:"0 / 0";
+  if($("#compPrev"))$("#compPrev").disabled=state.compSelectedIndex<=0;
+  if($("#compNext"))$("#compNext").disabled=state.compSelectedIndex>=max;
+  bindCurrentCompCard(); updateOnlineUi();
+}
+function bindCompPersonNavigation(){
+  $$(".comp-person-tab").forEach(b=>b.onclick=()=>showCompPerson(Number(b.dataset.index)));
+  $("#compPrev")&&($("#compPrev").onclick=()=>showCompPerson(state.compSelectedIndex-1));
+  $("#compNext")&&($("#compNext").onclick=()=>showCompPerson(state.compSelectedIndex+1));
+}
 async function renderCompensation(){
   if(!isOwnerOrManager()) return content().innerHTML=`<div class="state error">ไม่มีสิทธิ์</div>`;
-  content().innerHTML=`${pageTitle("ค่าตอบแทน","คำนวณเงินเดือน OT โบนัส เบิกเงิน ประกันสังคม และยอดโอน")}
-  <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="compMonth" type="month" value="${currentMonthKey()}"></div><div class="field"><label>&nbsp;</label><button id="loadComp" class="btn secondary">คำนวณ</button></div><div class="field"><label>&nbsp;</label><button id="saveAllComp" class="btn write-action">บันทึกทุกคน</button></div></div></div><div id="compResult"></div>`;
-  $("#loadComp").onclick=loadCompensation; $("#compMonth").onchange=loadCompensation; $("#saveAllComp").onclick=saveAllCompensation; await loadCompensation();
+  content().innerHTML=`${pageTitle("ค่าตอบแทน","ดูและแก้ไขทีละคน เลื่อนชื่อซ้าย–ขวาได้ พร้อม PDF และแชร์เข้า LINE")}
+  <div class="panel"><div class="grid three"><div class="field"><label>เดือน</label><input id="compMonth" type="month" value="${currentMonthKey()}"></div><div class="field"><label>&nbsp;</label><button id="loadComp" class="btn secondary">คำนวณใหม่</button></div><div class="field"><label>&nbsp;</label><button id="saveAllComp" class="btn write-action">บันทึกทุกคน</button></div></div></div><div id="compResult"></div>`;
+  $("#loadComp").onclick=()=>loadCompensation().catch(e=>showToast(friendlyError(e))); $("#compMonth").onchange=()=>{state.compSelectedIndex=0;state.compDrafts={};loadCompensation().catch(e=>showToast(friendlyError(e)));}; $("#saveAllComp").onclick=saveAllCompensation; await loadCompensation();
 }
 async function loadCompensation(){
-  const month=$("#compMonth").value; $("#compResult").innerHTML=`<div class="loading">กำลังคำนวณ...</div>`; const data=await calculateCompensationMonth(month); state.compData=data;
+  const month=$("#compMonth")?.value;if(!month)return;const seq=++state.compensationLoadSeq; $("#compResult").innerHTML=`<div class="loading">กำลังคำนวณค่าตอบแทน...</div>`; const data=await calculateCompensationMonth(month); if(seq!==state.compensationLoadSeq||state.currentPage!=="compensation"||!$("#compResult"))return; state.compData=data; state.compDrafts={}; state.compSelectedIndex=Math.min(state.compSelectedIndex||0,Math.max(0,data.rows.length-1));
   const totalNet=data.rows.reduce((s,r)=>s+r.netTransfer,0),totalCost=data.rows.reduce((s,r)=>s+r.totalCost,0);
-  const legalWarning=numberValue(data.settings.socialSecurity.maxSalaryBase)<=0?`<div class="state error"><b>ต้องตั้งค่าฐานเงินเดือนสูงสุดสำหรับประกันสังคมก่อนบันทึกค่าตอบแทน</b><br>${isOwner()?"กรุณากรอกค่าตามกฎหมายที่ใช้ในเดือนนี้ในส่วนตั้งค่าเรทด้านล่าง":"กรุณาให้เจ้าของเป็นผู้ตั้งค่า"}</div>`:"";
-  $("#compResult").innerHTML=`${legalWarning}${isOwner()?compSettingsHtml(data.settings):""}${metricCards([{label:"ยอดโอนรวมปลายเดือน",value:`${money(totalNet)} บาท`},{label:"ต้นทุนค่าตอบแทนรวม + ปกส. นายจ้าง",value:`${money(totalCost)} บาท`},{label:"พนักงาน",value:`${data.rows.length} คน`}])}<div class="comp-card-list">${data.rows.map(compCardHtml).join("")}</div>`;
-  $("#compSettingsForm")&&($("#compSettingsForm").onsubmit=saveCompSettings);
-  $$(".save-comp").forEach(b=>b.onclick=()=>saveCompCard(b.closest(".comp-card")));
-  $$(".comp-pdf").forEach(b=>b.onclick=()=>openCompPdf(b.closest(".comp-card")));
-  $$(".manage-paid-daily").forEach(b=>b.onclick=()=>openPaidDailyModal(b.closest(".comp-card").dataset.userId));
-  $$(".comp-card input:not([readonly])").forEach(i=>i.addEventListener("input",()=>refreshCompCard(i.closest(".comp-card"))));
+  const legalWarning=numberValue(data.settings.socialSecurity.maxSalaryBase)<=0?`<div class="state error"><b>ยังไม่ได้กรอกเพดานฐานเงินเดือนสูงสุดสำหรับประกันสังคม</b><br>${isOwner()?"เปิดส่วนตั้งค่าเรทด้านล่าง กรอกเพดานตามกฎหมายของเดือนนี้ แล้วกดบันทึก":"กรุณาให้เจ้าของเป็นผู้ตั้งค่า"}</div>`:"";
+  $("#compResult").innerHTML=`${legalWarning}${isOwner()?compSettingsHtml(data.settings):""}${metricCards([{label:"ยอดโอนรวมปลายเดือน",value:`${money(totalNet)} บาท`},{label:"ต้นทุนค่าตอบแทนรวม + ปกส. นายจ้าง",value:`${money(totalCost)} บาท`},{label:"พนักงาน",value:`${data.rows.length} คน`}])}${compPersonNavigatorHtml(data)}`;
+  $("#compSettingsForm")&&($("#compSettingsForm").onsubmit=saveCompSettings); bindCompPersonNavigation(); showCompPerson(state.compSelectedIndex,{remember:false});
 }
 function rowFromCard(card){
   const base=state.compData.rows.find(r=>r.userId===card.dataset.userId),salary=base.isDaily?0:numberValue(card.querySelector(".comp-salary")?.value),extraOther=numberValue(card.querySelector(".comp-extra").value),outsideOT=numberValue(card.querySelector(".comp-outside").value),deduction=numberValue(card.querySelector(".comp-deduction").value);
   const ssBase=base.isDaily?0:Math.min(salary,numberValue(base.settings.socialSecurity.maxSalaryBase)),employeeSS=ssBase*numberValue(base.settings.socialSecurity.employeeRate)/100,employerSS=ssBase*numberValue(base.settings.socialSecurity.employerRate)/100,basePay=base.isDaily?base.dailyWage:salary,gross=basePay+base.autoOT+extraOther+outsideOT+base.dailyBonus+base.monthlyBonus+base.beerBonus,netTransfer=gross-deduction-base.advances-employeeSS,totalCost=gross-deduction+employerSS;
-  return {...base,salary,extraOther,extraOtherNote:card.querySelector(".comp-extra-note").value.trim(),outsideOT,outsideOTNote:card.querySelector(".comp-outside-note").value.trim(),deduction,deductionNote:card.querySelector(".comp-deduction-note").value.trim(),bankName:card.querySelector(".comp-bank").value.trim(),bankAccountNumber:card.querySelector(".comp-account").value.trim(),employeeSS,employerSS,gross,netTransfer,totalCost};
+  return {...base,salary,extraOther,extraOtherNote:card.querySelector(".comp-extra-note").value.trim(),outsideOT,outsideOTNote:card.querySelector(".comp-outside-note").value.trim(),deduction,deductionNote:card.querySelector(".comp-deduction-note").value.trim(),bankName:card.querySelector(".comp-bank").value.trim(),bankAccountNumber:card.querySelector(".comp-account").value.trim(),ssBase,employeeSS,employerSS,gross,netTransfer,totalCost};
 }
 function refreshCompCard(card){ const r=rowFromCard(card),vals=card.querySelectorAll(".comp-summary-strip b"); vals[0].textContent=money(r.gross); vals[1].textContent=money(r.netTransfer); vals[2].textContent=money(r.totalCost); card.querySelector(".comp-head .pill").textContent=`โอน ${money(r.netTransfer)} บาท`; }
 async function saveCompSettings(e){
-  e.preventDefault(); if(!isOwner()||!requireOnline()) return; const month=$("#compMonth").value;
-  const s=mergeCompSettings({otRates:{front_kitchen:numberValue($("#otFrontKitchen").value),back_kitchen:numberValue($("#otBackKitchen").value),front_staff:numberValue($("#otFrontStaff").value),rotating:numberValue($("#otRotating").value)},dailyPay:{fullDay:numberValue($("#dailyFullRate").value),hourly:numberValue($("#dailyHourRate").value)},beerPerBottle:numberValue($("#beerRate").value),dailyBonus:{kitchen:{threshold:numberValue($("#dailyKitchenThreshold").value),amount:numberValue($("#dailyKitchenAmount").value)},front:{threshold:numberValue($("#dailyFrontThreshold").value),amount:numberValue($("#dailyFrontAmount").value)}},monthlyBonus:{kitchen:{threshold:numberValue($("#monthlyKitchenThreshold").value),amount:numberValue($("#monthlyKitchenAmount").value)},front:{threshold:numberValue($("#monthlyFrontThreshold").value),amount:numberValue($("#monthlyFrontAmount").value)}},socialSecurity:{employeeRate:numberValue($("#employeeSSRate").value),employerRate:numberValue($("#employerSSRate").value),maxSalaryBase:numberValue($("#ssMaxBase").value)}});
-  const batch=writeBatch(state.db); batch.set(doc(state.db,"compensationMonthSettings",month),{...s,monthKey:month,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:false}); batch.set(doc(state.db,"appSettings","main"),{compensationDefaults:s,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true}); await batch.commit(); state.settings.compensationDefaults=s; await audit("แก้เรทค่าตอบแทน",{monthKey:month},null,s); await afterWrite("comp_settings"); showToast("บันทึกเรทแล้ว"); await loadCompensation();
+  e.preventDefault(); if(!isOwner()||!requireOnline()) return; const button=e.submitter||e.currentTarget.querySelector("button[type=submit]"),month=$("#compMonth").value;setButtonBusy(button,true,"กำลังบันทึกเรท...");
+  try{
+    const s=mergeCompSettings({otRates:{front_kitchen:numberValue($("#otFrontKitchen").value),back_kitchen:numberValue($("#otBackKitchen").value),front_staff:numberValue($("#otFrontStaff").value),rotating:numberValue($("#otRotating").value)},dailyPay:{fullDay:numberValue($("#dailyFullRate").value),hourly:numberValue($("#dailyHourRate").value)},beerPerBottle:numberValue($("#beerRate").value),dailyBonus:{kitchen:{threshold:numberValue($("#dailyKitchenThreshold").value),amount:numberValue($("#dailyKitchenAmount").value)},front:{threshold:numberValue($("#dailyFrontThreshold").value),amount:numberValue($("#dailyFrontAmount").value)}},monthlyBonus:{kitchen:{threshold:numberValue($("#monthlyKitchenThreshold").value),amount:numberValue($("#monthlyKitchenAmount").value)},front:{threshold:numberValue($("#monthlyFrontThreshold").value),amount:numberValue($("#monthlyFrontAmount").value)}},socialSecurity:{employeeRate:numberValue($("#employeeSSRate").value),employerRate:numberValue($("#employerSSRate").value),maxSalaryBase:numberValue($("#ssMaxBase").value)}});
+    if((s.socialSecurity.employeeRate>0||s.socialSecurity.employerRate>0)&&s.socialSecurity.maxSalaryBase<=0)return showToast("กรุณากรอกเพดานฐานเงินเดือนสูงสุดประกันสังคม");
+    const batch=writeBatch(state.db); batch.set(doc(state.db,"compensationMonthSettings",month),{...s,monthKey:month,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:false}); batch.set(doc(state.db,"appSettings","main"),{compensationDefaults:s,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true}); await withTimeout(batch.commit(),18000,"บันทึกเรทค่าตอบแทน"); state.settings.compensationDefaults=s; audit("แก้เรทค่าตอบแทน",{monthKey:month},null,s).catch(console.warn); afterWrite("comp_settings").catch(console.warn); showToast("บันทึกเรทและเพดานประกันสังคมแล้ว"); await loadCompensation();
+  }catch(err){console.error("saveCompSettings",err);showToast(friendlyError(err));}
+  finally{setButtonBusy(button,false);}
+}
+async function saveCompRecord(r,{silent=false,button=null}={}){
+  if(!requireOnline()) return; if(!r.isDaily&&r.salary>0&&numberValue(r.settings.socialSecurity.maxSalaryBase)<=0){showToast("เจ้าของต้องตั้งค่าเพดานฐานเงินเดือนสูงสุดประกันสังคมก่อน");return;}
+  setButtonBusy(button,true,"กำลังบันทึก...");
+  try{
+    const id=`${r.monthKey}_${r.userId}`,ref=doc(state.db,"compensationRecords",id),before=await getDocResilient(ref,"ตรวจค่าตอบแทนเดิม");
+    const data={userId:r.userId,userName:r.userName,role:r.role,monthKey:r.monthKey,isDaily:r.isDaily,salary:r.salary,dailyWageBefore:r.dailyWageBefore,dailyPaid:r.dailyPaid,dailyWage:r.dailyWage,dailyFullDayEarned:r.dailyFullDayEarned||0,dailyHourlyEarned:r.dailyHourlyEarned||0,fullDayCount:r.fullDayCount||0,hourlyDayCount:r.hourlyDayCount||0,hourlyHours:r.hourlyHours||0,paidDailyCount:r.paidDailyCount||0,otHours:r.otHours||0,autoOT:r.autoOT,extraOther:r.extraOther,extraOtherNote:r.extraOtherNote,outsideOT:r.outsideOT,outsideOTNote:r.outsideOTNote,dailyBonus:r.dailyBonus,dailyBonusEligibleDays:r.dailyBonusEligibleDays||0,monthlyBonus:r.monthlyBonus,monthlySalesEligible:r.monthlySalesEligible,beerBonus:r.beerBonus,deduction:r.deduction,deductionNote:r.deductionNote,advances:r.advances,ssBase:r.ssBase||0,employeeSS:r.employeeSS,employerSS:r.employerSS,gross:r.gross,netTransfer:r.netTransfer,totalCost:r.totalCost,bankName:r.bankName,bankAccountNumber:r.bankAccountNumber,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id,updatedByName:state.currentUser.name};
+    const batch=writeBatch(state.db); batch.set(ref,data,{merge:true}); batch.set(doc(state.db,"users",r.userId),{salary:r.salary,bankName:r.bankName,bankAccountNumber:r.bankAccountNumber,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true}); await withTimeout(batch.commit(),18000,"บันทึกค่าตอบแทน");
+    const u=state.users.find(u=>u.id===r.userId); if(u){u.salary=r.salary;u.bankName=r.bankName;u.bankAccountNumber=r.bankAccountNumber;}
+    state.compDrafts[r.userId]=r; const idx=state.compData?.rows.findIndex(x=>x.userId===r.userId)??-1;if(idx>=0)state.compData.rows[idx]=r;
+    audit("บันทึกค่าตอบแทน",{monthKey:r.monthKey,user:r.userName,netTransfer:r.netTransfer},before.exists()?before.data():null,data).catch(console.warn); afterWrite("compensation").catch(console.warn); if(!silent) showToast(`บันทึก ${r.userName} แล้ว`); return data;
+  }catch(err){console.error("saveCompRecord",err);showToast(friendlyError(err));}
+  finally{setButtonBusy(button,false);}
 }
 async function saveCompCard(card,{silent=false}={}){
-  if(!requireOnline()) return; const r=rowFromCard(card); if(!r.isDaily&&r.salary>0&&numberValue(r.settings.socialSecurity.maxSalaryBase)<=0){showToast("เจ้าของต้องตั้งค่าฐานเงินเดือนสูงสุดประกันสังคมก่อน");return;} const id=`${r.monthKey}_${r.userId}`,ref=doc(state.db,"compensationRecords",id),before=await getDoc(ref);
-  const data={userId:r.userId,userName:r.userName,role:r.role,monthKey:r.monthKey,isDaily:r.isDaily,salary:r.salary,dailyWageBefore:r.dailyWageBefore,dailyPaid:r.dailyPaid,dailyWage:r.dailyWage,autoOT:r.autoOT,extraOther:r.extraOther,extraOtherNote:r.extraOtherNote,outsideOT:r.outsideOT,outsideOTNote:r.outsideOTNote,dailyBonus:r.dailyBonus,monthlyBonus:r.monthlyBonus,monthlySalesEligible:r.monthlySalesEligible,beerBonus:r.beerBonus,deduction:r.deduction,deductionNote:r.deductionNote,advances:r.advances,employeeSS:r.employeeSS,employerSS:r.employerSS,gross:r.gross,netTransfer:r.netTransfer,totalCost:r.totalCost,bankName:r.bankName,bankAccountNumber:r.bankAccountNumber,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id,updatedByName:state.currentUser.name};
-  const batch=writeBatch(state.db); batch.set(ref,data,{merge:true}); batch.set(doc(state.db,"users",r.userId),{salary:r.salary,bankName:r.bankName,bankAccountNumber:r.bankAccountNumber,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true}); await batch.commit();
-  const u=state.users.find(u=>u.id===r.userId); if(u){u.salary=r.salary;u.bankName=r.bankName;u.bankAccountNumber=r.bankAccountNumber;}
-  await audit("บันทึกค่าตอบแทน",{monthKey:r.monthKey,user:r.userName,netTransfer:r.netTransfer},before.exists()?before.data():null,data); await afterWrite("compensation"); if(!silent) showToast(`บันทึก ${r.userName} แล้ว`); return data;
+  if(!card)return; const r=rowFromCard(card); state.compDrafts[r.userId]=r; return saveCompRecord(r,{silent,button:silent?null:card.querySelector(".save-comp")});
 }
 async function saveAllCompensation(){
-  if(!requireOnline()) return;
-  const cards=$$(".comp-card");
-  const invalid=cards.some(card=>{ const r=rowFromCard(card); return !r.isDaily&&r.salary>0&&numberValue(r.settings.socialSecurity.maxSalaryBase)<=0; });
-  if(invalid) return showToast("เจ้าของต้องตั้งค่าฐานเงินเดือนสูงสุดประกันสังคมก่อนบันทึกทุกคน");
-  for(const card of cards){
-    const saved=await saveCompCard(card,{silent:true});
-    if(!saved) return showToast("บันทึกไม่ครบ กรุณาตรวจข้อมูลแล้วลองใหม่");
-  }
-  showToast("บันทึกค่าตอบแทนทุกคนแล้ว");
-  await loadCompensation();
+  if(!requireOnline()||!state.compData) return; rememberCurrentCompDraft(); const button=$("#saveAllComp");setButtonBusy(button,true,"กำลังบันทึกทุกคน...");
+  try{
+    const rows=state.compData.rows.map(r=>state.compDrafts[r.userId]||r);
+    if(rows.some(r=>!r.isDaily&&r.salary>0&&numberValue(r.settings.socialSecurity.maxSalaryBase)<=0)) return showToast("เจ้าของต้องตั้งค่าเพดานฐานเงินเดือนสูงสุดประกันสังคมก่อนบันทึกทุกคน");
+    for(let i=0;i<rows.length;i++){button.textContent=`กำลังบันทึก ${i+1}/${rows.length}`;const saved=await saveCompRecord(rows[i],{silent:true});if(!saved)throw new Error(`บันทึก ${rows[i].userName} ไม่สำเร็จ`);}
+    showToast("บันทึกค่าตอบแทนทุกคนแล้ว"); await loadCompensation();
+  }catch(err){console.error(err);showToast(friendlyError(err));}
+  finally{setButtonBusy(button,false);}
 }
 function openPaidDailyModal(userId){
   const r=state.compData.rows.find(x=>x.userId===userId); if(!r) return; const modal=document.createElement("div"); modal.className="modal-backdrop"; modal.id="paidDailyModal";
@@ -711,29 +821,69 @@ function openPaidDailyModal(userId){
   document.body.appendChild(modal); modal.querySelector(".close-modal").onclick=()=>modal.remove(); modal.addEventListener("click",e=>{if(e.target===modal)modal.remove();});
   modal.querySelector(".save-paid-daily").onclick=async()=>{ if(!requireOnline())return; const batch=writeBatch(state.db); modal.querySelectorAll("input[type=checkbox]").forEach(ch=>batch.set(doc(state.db,"attendance",ch.dataset.id),{paidDaily:ch.checked,updatedAt:serverTimestamp(),updatedBy:state.currentUser.id},{merge:true})); await batch.commit(); await audit("แก้สถานะรายวันได้รับเงินแล้ว",{user:r.userName,monthKey:r.monthKey}); await afterWrite("paid_daily"); modal.remove(); showToast("บันทึกแล้ว"); await loadCompensation(); };
 }
+function compShareText(r){
+  return `Rendo — สรุปค่าตอบแทน ${thaiMonth(r.monthKey)}\n${r.userName} (${ROLE_LABELS[r.role]||r.role})\nธนาคาร: ${r.bankName||"-"}\nเลขบัญชี: ${r.bankAccountNumber||"-"}\nยอดที่ต้องโอนปลายเดือน: ${money(r.netTransfer)} บาท`;
+}
 function compPdfHtml(r){
-  const role=ROLE_LABELS[r.role]||r.role,madeAt=new Date().toLocaleString("th-TH"); const row=(label,value,note="")=>numberValue(value)!==0?`<tr><td>${escapeHtml(label)}${note?`<div class="pdf-note">${escapeHtml(note)}</div>`:""}</td><td class="pdf-money">${money(value)}</td></tr>`:"";
-  return `<div class="pdf-document"><div class="pdf-header"><img src="./icons/logo.png" alt="Rendo"><div><h1>Rendo</h1><p>สรุปค่าตอบแทน ${thaiMonth(r.monthKey)}</p></div></div>
+  const role=ROLE_LABELS[r.role]||r.role,madeAt=new Date().toLocaleString("th-TH"),ss=r.settings.socialSecurity||{};
+  const row=(label,detail,value,cls="")=>`<tr class="${cls}"><td>${escapeHtml(label)}</td><td>${escapeHtml(detail||"-")}</td><td class="pdf-money">${money(value)}</td></tr>`;
+  const earnings=[];
+  if(r.isDaily){
+    earnings.push(row("ค่าจ้างทำงานทั้งวัน",`${numberValue(r.fullDayCount)} วัน × ${money(r.settings.dailyPay.fullDay)} บาท`,r.dailyFullDayEarned));
+    earnings.push(row("ค่าจ้างรายชั่วโมง",`${money(r.hourlyHours)} ชม. × ${money(r.settings.dailyPay.hourly)} บาท`,r.dailyHourlyEarned));
+    earnings.push(row("หักค่าจ้างที่รับไปแล้วระหว่างเดือน",`${numberValue(r.paidDailyCount)} รายการ`,-Math.abs(r.dailyPaid)));
+    earnings.push(row("ค่าจ้างคงเหลือที่นำมาคิดปลายเดือน","ค่าจ้างทั้งหมด − จ่ายแล้ว",r.dailyWage,"pdf-subtotal"));
+  }else earnings.push(row("เงินเดือน","เงินเดือนประจำ",r.salary));
+  earnings.push(row("OT จากวันทำงาน",`${money(r.otHours)} ชม. × ${money(r.settings.otRates[r.role]||0)} บาท`,r.autoOT));
+  earnings.push(row("OT / เพิ่มอื่น ๆ",r.extraOtherNote||"ไม่มีรายละเอียด",r.extraOther));
+  earnings.push(row("OT นอกเวลา",r.outsideOTNote||"ไม่มีรายละเอียด",r.outsideOT));
+  earnings.push(row("โบนัสรายวัน",`${numberValue(r.dailyBonusEligibleDays)} วันที่ผ่านเงื่อนไข`,r.dailyBonus));
+  earnings.push(row("โบนัสรายเดือน",`ยอดขายที่มีสิทธิ์ ${money(r.monthlySalesEligible)} บาท`,r.monthlyBonus));
+  earnings.push(row("โบนัสเบียร์","คำนวณแบ่งตามวันที่มีสิทธิ์",r.beerBonus));
+  const workRows=(r.dailyAttendance||[]).map(a=>`<tr><td>${thaiDate(a.date)}</td><td>${escapeHtml(attendanceStatusLabel(a.status))}${a.workStore?` · ${escapeHtml(a.workStore)}`:""}${a.status==="hourly"?` · ${escapeHtml(a.startTime)}–${escapeHtml(a.endTime)}`:""}</td><td class="pdf-money">${r.isDaily?money(dailyAttendancePay(a,r.settings)):"-"}</td><td class="pdf-money">${money(a.otHours||0)}</td><td>${r.isDaily?(a.paidDaily?"จ่ายแล้ว":"ยังไม่ติ๊กว่าจ่ายแล้ว"):"-"}</td></tr>`).join("");
+  return `<div class="pdf-document pdf-one-page"><div class="pdf-header"><img src="./icons/logo.png" alt="Rendo"><div><h1>Rendo</h1><p>สรุปค่าตอบแทน ${thaiMonth(r.monthKey)}</p></div></div>
   <div class="pdf-info-grid"><div><small>ชื่อพนักงาน</small><b>${escapeHtml(r.userName)}</b></div><div><small>ตำแหน่ง</small><b>${escapeHtml(role)}</b></div><div><small>ธนาคาร</small><b>${escapeHtml(r.bankName||"-")}</b></div><div><small>เลขบัญชี</small><b>${escapeHtml(r.bankAccountNumber||"-")}</b></div><div><small>จัดทำโดย</small><b>${escapeHtml(state.currentUser.name)}</b></div><div><small>วันที่จัดทำ</small><b>${escapeHtml(madeAt)}</b></div></div>
-  <table class="pdf-table"><thead><tr><th>รายการ</th><th>จำนวนเงิน (บาท)</th></tr></thead><tbody>
-  ${r.isDaily?row("ค่าจ้างรายวัน/รายชั่วโมงที่ยังไม่ได้รับ",r.dailyWage):row("เงินเดือน",r.salary)}${row("OT จากวันทำงาน",r.autoOT)}${row("OT/เพิ่มอื่น ๆ",r.extraOther,r.extraOtherNote)}${row("OT นอกเวลา",r.outsideOT,r.outsideOTNote)}${row("โบนัสรายวัน",r.dailyBonus)}${row("โบนัสรายเดือน",r.monthlyBonus)}${row("โบนัสเบียร์",r.beerBonus)}
-  <tr class="pdf-subtotal"><td>รวมรายรับก่อนหัก</td><td class="pdf-money">${money(r.gross)}</td></tr>${row("หักเงิน",-Math.abs(r.deduction),r.deductionNote)}${row("เงินเบิกล่วงหน้า",-Math.abs(r.advances))}${row("ประกันสังคมฝ่ายลูกจ้าง",-Math.abs(r.employeeSS))}<tr class="pdf-total"><td>ยอดที่ต้องโอนปลายเดือน</td><td class="pdf-money">${money(r.netTransfer)}</td></tr></tbody></table>
-  <div class="pdf-note-box"><b>หมายเหตุ:</b> เอกสารนี้แสดงถึงยอดที่ต้องโอนปลายเดือนเท่านั้น ไม่แสดงประกันสังคมนายจ้างและยอดต้นทุนรวม</div></div>`;
+  <div class="pdf-summary-grid"><div><small>วันทำงานทั้งวัน</small><b>${money(r.fullDayCount)} วัน</b></div><div><small>ชั่วโมงรายวัน</small><b>${money(r.hourlyHours)} ชม.</b></div><div><small>ชั่วโมง OT</small><b>${money(r.otHours)} ชม.</b></div></div>
+  <table class="pdf-table pdf-comp-table"><thead><tr><th>รายการ</th><th>รายละเอียดการคำนวณ</th><th>จำนวนเงิน (บาท)</th></tr></thead><tbody>${earnings.join("")}<tr class="pdf-subtotal"><td>รวมรายรับก่อนหัก</td><td>รวมค่าตอบแทนทั้งหมดก่อนรายการหัก</td><td class="pdf-money">${money(r.gross)}</td></tr>${row("หักเงิน",r.deductionNote||"ไม่มีรายละเอียด",-Math.abs(r.deduction))}${row("เงินเบิกล่วงหน้า","รวมรายการเบิกในเดือนนี้",-Math.abs(r.advances))}${row("ประกันสังคมฝ่ายลูกจ้าง",`${money(ss.employeeRate)}% ของฐาน ${money(r.ssBase)} บาท · เพดานฐาน ${money(ss.maxSalaryBase)} บาท`,-Math.abs(r.employeeSS))}<tr class="pdf-total"><td>ยอดที่ต้องโอนปลายเดือน</td><td>รวมรายรับ − หักเงิน − เงินเบิก − ประกันสังคมลูกจ้าง</td><td class="pdf-money">${money(r.netTransfer)}</td></tr></tbody></table>
+  ${(r.dailyAttendance||[]).length?`<section class="pdf-work-section"><h3>รายละเอียดวันทำงานและการจ่ายรายวัน</h3><table class="pdf-table pdf-work-table"><thead><tr><th>วันที่</th><th>สถานะ / เวลา / ร้าน</th><th>ค่าจ้างรายวัน</th><th>OT ชม.</th><th>สถานะจ่ายรายวัน</th></tr></thead><tbody>${workRows}</tbody></table></section>`:""}
+  <div class="pdf-note-box"><b>หมายเหตุ:</b> รายงานนี้แสดงรายการค่าตอบแทนและรายการหักครบจนถึงยอดที่ต้องโอนปลายเดือน</div></div>`;
 }
 function openCompPdf(card){
-  const r=rowFromCard(card),modal=document.createElement("div"); modal.className="modal-backdrop"; modal.id="compPdfModal";
-  modal.innerHTML=`<div class="modal-card"><div class="modal-head"><div><h3>รายละเอียด / PDF</h3><p>${escapeHtml(r.userName)} · ${thaiMonth(r.monthKey)}</p></div><button class="btn ghost small close-modal">ปิด</button></div><div class="pdf-sheet">${compPdfHtml(r)}</div><div class="modal-actions"><button class="btn secondary copy-comp">คัดลอกข้อความ</button><button class="btn secondary download-comp">ดาวน์โหลด PDF</button><button class="btn share-comp">แชร์ PDF</button></div></div>`;
+  const r=rowFromCard(card);state.compDrafts[r.userId]=r;const modal=document.createElement("div"); modal.className="modal-backdrop"; modal.id="compPdfModal";
+  modal.innerHTML=`<div class="modal-card comp-pdf-modal"><div class="modal-head"><div><h3>รายงานค่าตอบแทน</h3><p>${escapeHtml(r.userName)} · ${thaiMonth(r.monthKey)}</p></div><button class="btn ghost small close-modal">ปิด</button></div><div class="pdf-sheet">${compPdfHtml(r)}</div><div class="modal-actions"><button class="btn secondary copy-comp">คัดลอกสรุป</button><button class="btn secondary download-comp">ดาวน์โหลด PDF</button><button class="btn share-comp">แชร์ PDF เข้า LINE</button></div></div>`;
   document.body.appendChild(modal); modal.querySelector(".close-modal").onclick=()=>modal.remove(); modal.addEventListener("click",e=>{if(e.target===modal)modal.remove();});
-  modal.querySelector(".copy-comp").onclick=async()=>{ const text=`Rendo — ${thaiMonth(r.monthKey)}\n${r.userName}\nธนาคาร: ${r.bankName||"-"} ${r.bankAccountNumber||"-"}\nยอดโอนปลายเดือน: ${money(r.netTransfer)} บาท`; try{await navigator.clipboard.writeText(text);showToast("คัดลอกแล้ว");}catch(_){alert(text);} };
-  modal.querySelector(".download-comp").onclick=()=>downloadCompPdf(r); modal.querySelector(".share-comp").onclick=()=>shareCompPdf(r);
+  modal.querySelector(".copy-comp").onclick=async()=>{const text=compShareText(r);try{await navigator.clipboard.writeText(text);showToast("คัดลอกสรุปแล้ว");}catch(_){alert(text);}};
+  modal.querySelector(".download-comp").onclick=e=>downloadCompPdf(r,e.currentTarget); modal.querySelector(".share-comp").onclick=e=>shareCompPdf(r,e.currentTarget);
+}
+async function waitForPdfLibrary(){
+  for(let i=0;i<40;i++){if(window.html2pdf)return;await sleep(200);}throw new Error("โหลดตัวสร้าง PDF ไม่สำเร็จ กรุณาตรวจอินเทอร์เน็ตแล้วเปิดแอปใหม่");
+}
+async function waitForImages(root){
+  const images=[...root.querySelectorAll("img")];await Promise.all(images.map(img=>img.complete?Promise.resolve():new Promise(resolve=>{img.onload=resolve;img.onerror=resolve;setTimeout(resolve,3000);}))); 
 }
 async function makeCompPdfFile(r){
-  if(!window.html2pdf) throw new Error("ตัวสร้าง PDF ยังโหลดไม่สำเร็จ กรุณาต่ออินเทอร์เน็ต"); const root=document.createElement("div"); root.className="pdf-export-root"; root.innerHTML=compPdfHtml(r); document.body.appendChild(root); const name=`Rendo_ค่าตอบแทน_${String(r.userName).replace(/[\\/:*?\"<>|\s]+/g,"_")}_${r.monthKey}.pdf`;
-  try{ const blob=await window.html2pdf().set({margin:[5,5,5,5],filename:name,image:{type:"jpeg",quality:.98},html2canvas:{scale:2,useCORS:true,backgroundColor:"#ffffff"},jsPDF:{unit:"mm",format:"a4",orientation:"portrait"}}).from(root.firstElementChild).outputPdf("blob"); return new File([blob],name,{type:"application/pdf"}); }finally{root.remove();}
+  await waitForPdfLibrary(); const name=`Rendo_ค่าตอบแทน_${String(r.userName).replace(/[\\/:*?"<>|\s]+/g,"_")}_${r.monthKey}.pdf`;
+  const overlay=document.createElement("div");overlay.className="pdf-generating-overlay";overlay.innerHTML=`<div><div class="loading-spinner"></div><b>กำลังสร้าง PDF...</b><small>กรุณารอสักครู่</small></div>`;
+  const root=document.createElement("div");root.className="pdf-export-root pdf-export-active";root.innerHTML=compPdfHtml(r);document.body.append(root,overlay);
+  try{
+    await waitForImages(root);await new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+    const worker=window.html2pdf().set({margin:[6,6,7,6],filename:name,image:{type:"jpeg",quality:.96},html2canvas:{scale:1.7,useCORS:true,allowTaint:false,backgroundColor:"#ffffff",logging:false,windowWidth:794,scrollX:0,scrollY:0},jsPDF:{unit:"mm",format:"a4",orientation:"portrait",compress:true},pagebreak:{mode:["css","legacy"],avoid:["tr",".pdf-info-grid",".pdf-summary-grid"]}}).from(root.firstElementChild).toPdf();
+    const pdf=await worker.get("pdf"),blob=pdf.output("blob");if(!blob||blob.size<1500)throw new Error("ไฟล์ PDF ที่สร้างไม่สมบูรณ์ กรุณาลองใหม่");return new File([blob],name,{type:"application/pdf"});
+  }finally{root.remove();overlay.remove();}
 }
-async function downloadCompPdf(r){ try{const file=await makeCompPdfFile(r),a=document.createElement("a");a.href=URL.createObjectURL(file);a.download=file.name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1500);showToast("สร้าง PDF แล้ว");}catch(e){showToast(e.message);} }
-async function shareCompPdf(r){ try{const file=await makeCompPdfFile(r); if(navigator.canShare&&navigator.canShare({files:[file]})) await navigator.share({files:[file],title:`ค่าตอบแทน ${r.userName}`,text:`Rendo ${thaiMonth(r.monthKey)}`}); else await downloadCompPdf(r);}catch(e){showToast(e.message||"แชร์ไม่สำเร็จ");} }
-
+function saveFileToDevice(file){const a=document.createElement("a"),url=URL.createObjectURL(file);a.href=url;a.download=file.name;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),3000);}
+async function downloadCompPdf(r,button=null){
+  setButtonBusy(button,true,"กำลังสร้าง PDF...");try{const file=await makeCompPdfFile(r);saveFileToDevice(file);showToast("ดาวน์โหลด PDF แล้ว");return file;}catch(e){console.error("pdf",e);showToast(friendlyError(e));}finally{setButtonBusy(button,false);}
+}
+async function shareCompPdf(r,button=null){
+  setButtonBusy(button,true,"กำลังเตรียมแชร์...");
+  try{
+    const file=await makeCompPdfFile(r),shareData={files:[file],title:`ค่าตอบแทน ${r.userName}`,text:`Rendo ${thaiMonth(r.monthKey)} · ยอดโอน ${money(r.netTransfer)} บาท`};
+    if(navigator.share&&(!navigator.canShare||navigator.canShare({files:[file]}))){await navigator.share(shareData);showToast("เลือก LINE จากหน้าต่างแชร์ได้เลย");}
+    else{saveFileToDevice(file);try{await navigator.clipboard.writeText(compShareText(r));}catch(_){}alert("อุปกรณ์หรือเบราว์เซอร์นี้ส่งไฟล์ตรงเข้า LINE ไม่ได้\nระบบดาวน์โหลด PDF และคัดลอกข้อความสรุปให้แล้ว กรุณาเปิด LINE แล้วแนบไฟล์ PDF ที่ดาวน์โหลด");}
+  }catch(e){if(e?.name!=="AbortError"){console.error("share pdf",e);showToast(friendlyError(e));}}
+  finally{setButtonBusy(button,false);}
+}
 /* ------------------------------- ลงรายจ่าย ------------------------------- */
 async function renderOwnerExpenses(){
   if(!isOwnerOrManager()) return content().innerHTML=`<div class="state error">ไม่มีสิทธิ์</div>`;
@@ -780,7 +930,7 @@ async function renderHistory(category){
   let rows;
   if(isOwner()) rows=(await allDocs("auditLogs")).filter(r=>r.category===category);
   else {
-    const snap=await getDocs(query(collection(state.db,"auditLogs"),where("category","==","activity"),where("hidden","==",false)));
+    const snap=await getDocsResilient(query(collection(state.db,"auditLogs"),where("category","==","activity"),where("hidden","==",false)),"โหลดประวัติ");
     rows=snap.docs.map(d=>({id:d.id,...d.data()}));
   }
   rows=rows.sort((a,b)=>String(b.createdAtISO||"").localeCompare(String(a.createdAtISO||""))).slice(0,400);
@@ -795,17 +945,27 @@ async function processPendingBackupRequests(){
 }
 function setupAutoBackupTimer(){
   clearInterval(state.backupTimer); const a=state.settings.autoBackup||{}; if(!isOwner())return;
-  if(a.mode==="onAction"||a.mode==="both") setTimeout(()=>processPendingBackupRequests(),1200);
+  if(a.mode==="onAction"||a.mode==="both") setTimeout(()=>processPendingBackupRequests(),15000);
   if(!["interval","both"].includes(a.mode)||!a.url)return; const mins=Math.max(5,numberValue(a.intervalMinutes||60)); state.backupTimer=setInterval(()=>performBackup("auto_interval",true).catch(console.warn),mins*60*1000);
 }
-async function exportAllData(){ const out={app:"Rendo",version:VERSION,exportedAt:new Date().toISOString(),projectId:window.RENDO_FIREBASE_CONFIG?.projectId||"",collections:{}}; for(const name of COLLECTIONS){ const snap=await getDocs(collection(state.db,name)); out.collections[name]=snap.docs.map(d=>({id:d.id,data:safeClone(d.data())})); } return out; }
+async function exportAllData(){
+  const out={app:"Rendo",version:VERSION,exportedAt:new Date().toISOString(),projectId:window.RENDO_FIREBASE_CONFIG?.projectId||"",collections:{}};
+  for(let i=0;i<COLLECTIONS.length;i+=4){const names=COLLECTIONS.slice(i,i+4),results=await Promise.all(names.map(name=>getDocsResilient(collection(state.db,name),`สำรอง ${name}`,20000)));results.forEach((snap,j)=>{out.collections[names[j]]=snap.docs.map(d=>({id:d.id,data:safeClone(d.data())}));});}
+  return out;
+}
 function downloadBlob(blob,name){ const a=document.createElement("a");a.href=URL.createObjectURL(blob);a.download=name;a.click();setTimeout(()=>URL.revokeObjectURL(a.href),1500); }
 function csvEscape(v){ const s=String(v??"");return /[",\n\r]/.test(s)?`"${s.replaceAll('"','""')}"`:s; }
 function backupToCsv(data){ const rows=[["collection","id","dataJSON"]]; Object.entries(data.collections||{}).forEach(([name,items])=>(items||[]).forEach(x=>rows.push([name,x.id,JSON.stringify(x.data)]))); return rows.map(r=>r.map(csvEscape).join(",")).join("\r\n"); }
 async function performBackup(reason="manual",silent=false){
   if(!state.online)throw new Error("ออฟไลน์"); const url=String(state.settings.autoBackup?.url||"").trim(); if(!url){if(!silent)showToast("ยังไม่ได้ใส่ Google Apps Script Web App URL");return;}
-  const data=await exportAllData(); data.backupReason=reason; const form=new FormData();form.append("payload",JSON.stringify(data)); await fetch(url,{method:"POST",body:form,mode:"no-cors"});
-  await addDoc(collection(state.db,"backupsMetadata"),{reason,exportedAt:data.exportedAt,createdAt:serverTimestamp(),createdBy:state.currentUser?.id||null,createdByName:state.currentUser?.name||"ระบบ"}); if(!silent)showToast("ส่งข้อมูลสำรองไป Google Drive แล้ว");
+  if(state.backupInProgress){state.backupQueued=true;if(!silent)showToast("กำลังสำรองข้อมูลอยู่ ระบบจะทำรอบถัดไปให้อัตโนมัติ");return;}
+  state.backupInProgress=true;
+  try{
+    const data=await exportAllData(); data.backupReason=reason; const form=new FormData();form.append("payload",JSON.stringify(data)); await withTimeout(fetch(url,{method:"POST",body:form,mode:"no-cors"}),30000,"ส่งข้อมูลสำรอง");
+    await withTimeout(addDoc(collection(state.db,"backupsMetadata"),{reason,exportedAt:data.exportedAt,createdAt:serverTimestamp(),createdBy:state.currentUser?.id||null,createdByName:state.currentUser?.name||"ระบบ"}),12000,"บันทึกประวัติสำรอง"); if(!silent)showToast("ส่งข้อมูลสำรองไป Google Drive แล้ว");
+  }finally{
+    state.backupInProgress=false;if(state.backupQueued){state.backupQueued=false;setTimeout(()=>performBackup("queued_after_busy",true).catch(console.warn),5000);}
+  }
 }
 async function renderBackup(){
   if(!isOwner())return content().innerHTML=`<div class="state error">เฉพาะเจ้าของ</div>`; const a=state.settings.autoBackup||DEFAULT_SETTINGS.autoBackup;
